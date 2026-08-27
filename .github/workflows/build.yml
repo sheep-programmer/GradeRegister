@@ -7,6 +7,12 @@ on:
   push:
     tags: ["v*"]
 
+env:
+  # Windows 构建机的控制台是 cp1252，打印中文会抛 UnicodeEncodeError。
+  # 代码入口已经自己处理，这里再兜一层，覆盖 unittest 等间接的输出
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
 jobs:
   build:
     strategy:

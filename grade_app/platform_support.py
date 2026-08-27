@@ -15,6 +15,24 @@ IS_WINDOWS = os.name == "nt"
 IS_LINUX = not IS_MAC and not IS_WINDOWS
 
 
+def ensure_utf8_output() -> None:
+    """把标准输出重设为 UTF-8，让中文提示在任何控制台都打得出来。
+
+    Windows 的控制台按本地代码页解码（简体中文版是 cp936，英文版与 CI
+    环境是 cp1252），print 中文会直接抛 UnicodeEncodeError 把程序打断。
+    无法表示的字符降级替换，宁可显示成问号也不能中断整个流程。
+    """
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue          # 没有控制台（打包成窗口程序）或流是替身
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass              # 流已关闭或不支持重配，保持原样即可
+
+
 def platform_name() -> str:
     if IS_MAC:
         return "macOS"

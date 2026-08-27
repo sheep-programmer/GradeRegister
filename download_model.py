@@ -6,6 +6,7 @@ import sys
 
 from grade_app import speech
 from grade_app.config import load_config
+from grade_app.platform_support import ensure_utf8_output
 
 SIZES = {"sense-voice": "约 228MB", "vosk": "约 42MB",
          "faster-whisper": "约 460MB", "sherpa": "随项目自带"}
@@ -22,6 +23,7 @@ def progress(done: int, total: int) -> None:
 
 
 def main() -> int:
+    ensure_utf8_output()        # 先理顺编码，否则 Windows 上第一句中文就崩
     cfg = load_config()
     engine = cfg.get("engine", "sense-voice")
     print(f"当前语音引擎: {engine}（{SIZES.get(engine, '未知体积')}）")
