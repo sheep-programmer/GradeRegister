@@ -1,0 +1,61 @@
+name: 打包
+
+# 没有 Windows 电脑时用这个：推一个 tag 或手动点一下，
+# GitHub 会分别在 Windows 和 macOS 上各打一个包，跑完在 Artifacts 里下载。
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: 成绩登记-Windows
+            path: dist/GradeRegister
+          - os: macos-latest
+            artifact: 成绩登记-macOS
+            path: dist/成绩登记.app
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: 缓存语音模型
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: models/sense-voice
+          key: sense-voice-model-v1
+
+      - name: 下载语音模型
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: python download_model.py
+
+      - name: 跑测试
+        run: python -m unittest discover -s tests
+        # 无头环境跑不了 tkinter 界面测试，失败不拦住打包
+        continue-on-error: true
+
+      - name: 打包
+        run: pyinstaller GradeRegister.spec --noconfirm
+
+      - name: 上传
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.path }}
+          retention-days: 30

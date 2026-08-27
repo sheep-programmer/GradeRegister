@@ -1,0 +1,16 @@
+# 统一换行符：脚本在两个平台上都要能直接跑
+* text=auto eol=lf
+*.bat text eol=crlf
+*.command text eol=lf
+
+# 二进制，不做换行符转换也不参与 diff
+*.xlsx binary
+*.onnx binary
+*.dylib binary
+*.dll binary
+*.so binary
+*.zip binary
+*.dmg binary
+
+# 语言统计忽略文档与规格，让 Gitee 正确显示这是 Python 项目
+docs/** linguist-documentation

@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 运行期产物
+config.json
+gui_runtime.log
+backups/
+models/
+:memory:*
+
+# 打包产物
+build/
+dist/
+*.spec.bak
+
+.DS_Store
+.idea/
+.vscode/
