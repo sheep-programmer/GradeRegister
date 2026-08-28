@@ -271,11 +271,13 @@ def remove_matched_names(text: str, names: Iterable[str]) -> str:
 
 
 def is_number_text(text: str) -> bool:
-    """判断清理后的文本是否纯数字（含中文数字）——纯数字绝不能当人名。
+    """判断清理后的文本是不是纯粹在念数字——纯数字绝不能当人名。
 
-    防止「十三」因共享「三」字被模糊匹配成「张三」。
+    「分」字要先剥掉再判断：「十三分」带着它就不算数字，于是会掉进姓名
+    匹配的单字重叠兜底里，跟「张三」共享一个「三」字就被判成张三，
+    分数直接填到别人那一行。
     """
-    t = clean_name_text(text)
+    t = _SUFFIX_RE.sub("", clean_name_text(text))
     return bool(t) and all(ch in "零一二两三四五六七八九十百点．.0123456789"
                            for ch in t)
 
@@ -287,8 +289,8 @@ def match_student_names(text: str, names: Iterable[str], cutoff: float = 0.45) -
     用 find_student_rows 处理重名选择。
     """
     t = clean_name_text(text)
-    if not t:
-        return []
+    if not t or is_number_text(t):
+        return []          # 纯粹在念分数，不管从哪调进来都不能匹配成人名
     name_list = list(dict.fromkeys(names))  # 去重保序
 
     # 1) 精确匹配

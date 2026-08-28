@@ -94,6 +94,40 @@ def block_rms(block: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(block)))) if block.size else 0.0
 
 
+class SpeechGate:
+    """判断一块音频算不算人声，门槛随环境底噪自适应。
+
+    固定门槛只在安静房间成立。底噪一旦超过它，每一块都被当成人声，
+    「最后一次听到声音」的时间被永久刷新，说完话永远等不到停顿——
+    几句话会被连成一整段，界面上看就是「半天没反应」。
+    """
+
+    FLOOR = SPEECH_LEVEL   # 再安静也不低于此，免得把电噪声当人声
+    MARGIN = 2.5           # 人声要高过底噪这么多倍
+    DECAY = 0.25           # 遇到更安静的立刻跟下去
+    RISE = 0.002           # 底噪只许缓慢抬升，防止说着说着把自己盖住
+
+    def __init__(self) -> None:
+        self.noise: Optional[float] = None
+
+    def threshold(self) -> float:
+        if self.noise is None:
+            return self.FLOOR
+        return max(self.FLOOR, self.noise * self.MARGIN)
+
+    def feed(self, rms: float) -> bool:
+        """更新底噪估计并返回这一块是不是人声。"""
+        speech = rms >= self.threshold()
+        if self.noise is None:
+            self.noise = rms
+        elif rms < self.noise:
+            self.noise += (rms - self.noise) * self.DECAY
+        elif not speech:
+            # 只有判定为非人声时才允许抬高基线
+            self.noise += (rms - self.noise) * self.RISE
+        return speech
+
+
 class AutoGain:
     """软件自动增益。所有音量一律用 0~1 归一化量纲。
 
@@ -169,6 +203,9 @@ class SegmentTimer:
     # 可配置断句间隔的合理区间：再短会把一句话切碎，再长等着难受
     MIN_GAP = 0.3
     MAX_GAP = 3.0
+    # 一句话最长多少秒。人声判定万一失灵（环境太吵、增益异常），
+    # 靠它兜住：宁可切早一点，也不能让几句话连成一整段
+    MAX_SEGMENT = 12.0
 
     def __init__(self, now: Optional[float] = None,
                  streaming: bool = True, gap=None) -> None:
@@ -178,6 +215,7 @@ class SegmentTimer:
         self.last_partial_text = ""
         self.last_change = t
         self.last_sound = t
+        self.segment_start = t
         self.heard_speech = False
 
     @classmethod
@@ -197,24 +235,34 @@ class SegmentTimer:
             self.last_partial_text = text
             self.last_change = time.time() if now is None else now
 
-    def note_level(self, level: float, now: Optional[float] = None) -> None:
-        if level >= SPEECH_LEVEL:
-            self.last_sound = time.time() if now is None else now
+    def note_level(self, level: float, now: Optional[float] = None,
+                   is_speech: Optional[bool] = None) -> None:
+        """汇报一块音频的音量。is_speech 由自适应门槛给出，缺省用固定阈值。"""
+        speech = (level >= SPEECH_LEVEL) if is_speech is None else is_speech
+        if speech:
+            t = time.time() if now is None else now
+            if not self.heard_speech:
+                self.segment_start = t
+            self.last_sound = t
             self.heard_speech = True
 
     def should_cut(self, now: Optional[float] = None) -> bool:
         if not self.heard_speech:
             return False
         t = time.time() if now is None else now
+        if t - self.segment_start > self.MAX_SEGMENT:
+            return True          # 兜底：判定失灵时也不能无限累积
         if not self.streaming:
             return t - self.last_sound > self.gap
         return (t - self.last_change > self.gap
                 or t - self.last_sound > self.SILENCE_GAP)
 
     def reset(self, now: Optional[float] = None) -> None:
+        t = time.time() if now is None else now
         self.heard_speech = False
         self.last_partial_text = ""
-        self.last_change = time.time() if now is None else now
+        self.last_change = t
+        self.segment_start = t
 
     def silent_for(self, now: Optional[float] = None) -> float:
         return (time.time() if now is None else now) - self.last_sound
@@ -281,6 +329,7 @@ class Recorder:
         levels: List[float] = []
         raw_levels: List[float] = []
         gain = AutoGain()
+        gate = SpeechGate()
         timer = SegmentTimer(streaming=getattr(engine, "streaming", True),
                              gap=self.cfg.get("segment_gap"))
         warned_silent = False
@@ -326,8 +375,11 @@ class Recorder:
                             levels.clear()
                             self.emit("level", peak)
                         if raw_levels:
-                            timer.note_level(max(raw_levels))
+                            raw = max(raw_levels)
                             raw_levels.clear()
+                            # 门槛跟着环境底噪走：固定阈值在吵一点的地方
+                            # 会把底噪当人声，于是永远等不到「说完」
+                            timer.note_level(raw, is_speech=gate.feed(raw))
 
                     if use_endpoint and timer.heard_speech:
                         if self._cut_by_endpoint(engine, timer):
@@ -345,7 +397,9 @@ class Recorder:
             print(f"[voice] 麦克风出错: {e}", flush=True)
             return
 
-        print(f"[voice] 本次录音结束: 最大音量={max_peak:.4f}", flush=True)
+        print(f"[voice] 本次录音结束: 最大音量={max_peak:.4f} "
+              f"底噪={gate.noise or 0:.5f} 人声门槛={gate.threshold():.5f}",
+              flush=True)
         try:
             final = engine.finalize()
         except Exception as e:  # noqa: BLE001
@@ -372,6 +426,9 @@ class Recorder:
 
     def _cut_by_timer(self, engine, timer: SegmentTimer) -> bool:
         """按停顿切句（无端点检测的引擎）；返回 False 表示出错需退出线程。"""
+        if timer.silent_for() < timer.gap:
+            print(f"[voice] 说了 {SegmentTimer.MAX_SEGMENT:.0f} 秒还没停，"
+                  "先断一句（环境偏吵时会这样）", flush=True)
         self.emit("thinking", "")
         fallback = timer.last_partial_text
         try:

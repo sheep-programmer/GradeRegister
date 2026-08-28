@@ -1144,3 +1144,61 @@ class TestPinyinSimilarity(unittest.TestCase):
         for got, want in (("张三", "李四"), ("刘洋", "陈静")):
             self.assertLess(parser.pinyin_similarity(got, want), th,
                             msg=f"{got}->{want} 不该被纠")
+
+
+class TestScoreTextIsNotAName(unittest.TestCase):
+    """纯分数绝不能被当人名——「十三分」和「张三」共享一个「三」字。"""
+
+    NAMES = ["张三", "李四", "王五"]
+
+    def test_score_with_fen_is_number_text(self):
+        for t in ("十三分", "13分", "三分", "二十分", "十二分"):
+            self.assertTrue(parser.is_number_text(t), t)
+
+    def test_score_does_not_match_any_name(self):
+        for t in ("十三分", "三分", "十五分"):
+            self.assertEqual(parser.match_student_names(t, self.NAMES), [], t)
+
+    def test_real_names_still_match(self):
+        self.assertEqual(parser.match_student_names("张三", self.NAMES), ["张三"])
+        self.assertIn("王五", parser.match_student_names("王虎", self.NAMES))
+
+    def test_name_containing_number_char_still_a_name(self):
+        """「王五」「李十一」这类名字本身带数字字，不能被当成分数。"""
+        names = ["王五", "李十一", "张三"]
+        self.assertFalse(parser.is_number_text("王五"))
+        self.assertFalse(parser.is_number_text("李十一"))
+        self.assertEqual(parser.match_student_names("王五", names), ["王五"])
+
+    def test_question_head_not_a_number_text(self):
+        self.assertFalse(parser.is_number_text("第一题"))
+
+
+class TestScoreTextInState(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "t.xlsx")
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["姓名", "第一题", "第二题", "第三题", "总分"])
+        for n in ("张三", "李四", "王五"):
+            ws.append([n, "", "", "", ""])
+        wb.save(self.path)
+        self.state = AppState(cfg=CFG)
+        self.state.load(load_sheet(self.path, CFG, backup=False))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_score_does_not_switch_student(self):
+        """选中李四后念「十三分」，必须填到李四，不能跳去张三。"""
+        self.state.handle_text("李四")
+        self.assertEqual(self.state.current.name, "李四")
+        self.state.handle_text("十三分")
+        self.assertEqual(self.state.current.name, "李四")
+        self.assertEqual(self.state.current.scores.get(1), 13.0)
+
+    def test_score_before_any_student_asks_for_a_name(self):
+        r = self.state.handle_text("十三分")
+        self.assertIsNone(self.state.current)
+        self.assertFalse(r.ok)
