@@ -89,6 +89,7 @@ class GradeApp(tk.Tk):
         m_help = tk.Menu(menubar, tearoff=0)
         m_help.add_command(label="使用说明", command=self.show_help)
         m_help.add_command(label="麦克风没声音？", command=self.show_mic_help)
+        m_help.add_command(label="打开日志文件夹", command=self.open_log_folder)
         menubar.add_cascade(label="帮助", menu=m_help)
         self.config(menu=menubar)
 
@@ -312,8 +313,10 @@ class GradeApp(tk.Tk):
                 return
             self.cfg["device"] = idx
             self._emit("mic_picked", sd.query_devices(idx).get("name", f"设备{idx}"))
-        except Exception:  # noqa: BLE001
-            pass   # 挑选失败就回退系统默认设备
+        except Exception as exc:  # noqa: BLE001
+            # 回退到系统默认设备继续跑，但要留下痕迹：
+            # Windows 上录不到音时，这行往往是唯一的线索
+            print(f"[warn] 自动挑选麦克风失败，改用系统默认: {exc}", flush=True)
 
     def _on_engine_error(self, err: str) -> None:
         """区分缺依赖与模型未就绪，给出可操作的指引。"""
@@ -941,6 +944,19 @@ class GradeApp(tk.Tk):
             self._activate_index(self._menu_row, announce=True)
 
     # ================================================================= 关闭
+    def open_log_folder(self) -> None:
+        """打开日志所在目录。打包版没有控制台，出问题只能靠这个文件。"""
+        from .. import paths
+        folder = paths.user_data_dir()
+        log = paths.log_path()
+        if not os.path.exists(log):
+            self._notify(f"还没有日志文件（源码运行时日志直接打在终端里）：{folder}",
+                         "info")
+        try:
+            platform_support.open_in_default_app(folder)
+        except Exception as e:  # noqa: BLE001
+            self._notify(f"打不开文件夹：{e}\n路径：{folder}", "warn")
+
     def _on_close(self) -> None:
         self.recorder.stop()
         if self.state.model is not None:

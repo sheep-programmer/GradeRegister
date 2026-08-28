@@ -1049,3 +1049,98 @@ class TestSplitAtTotal(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestNameAndScoresInOneBreath(unittest.TestCase):
+    """「赵磊第一题十分第二题十二分」这类连念，在任何阶段都要填得进去。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "t.xlsx")
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["姓名", "第一题", "第二题", "第三题", "第四题", "总分"])
+        for n in ("赵磊", "张三", "李四"):
+            ws.append([n, "", "", "", "", ""])
+        wb.save(self.path)
+        self.state = AppState(cfg=CFG)
+        self.state.load(load_sheet(self.path, CFG, backup=False))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _scores(self):
+        m = self.state.model
+        return [self.state.current.scores.get(c) for c in m.score_cols]
+
+    def test_fills_from_idle_phase(self):
+        """刚启动（idle）就连名带分念一整句。"""
+        self.assertEqual(self.state.phase, "idle")
+        self.state.handle_text("赵磊第一题十分第二题十二分")
+        self.assertEqual(self.state.current.name, "赵磊")
+        self.assertEqual(self._scores(), [10.0, 12.0, None, None])
+
+    def test_fills_from_scoring_phase(self):
+        self.state.handle_text("张三")
+        self.state.handle_text("赵磊第一题十分第二题十二分")
+        self.assertEqual(self.state.current.name, "赵磊")
+        self.assertEqual(self._scores(), [10.0, 12.0, None, None])
+
+    def test_real_world_misheard_sentence(self):
+        """实际录到的一句：「是跟」是「十分」的误听，题号超范围的那个忽略掉。"""
+        r = self.state.handle_text(
+            "赵磊第一题是跟第二题十二分第三题七分第八题七十五分")
+        self.assertEqual(self.state.current.name, "赵磊")
+        self.assertEqual(self._scores()[:3], [10.0, 12.0, 7.0])
+        self.assertIn("超出范围", r.message)
+
+    def test_plain_name_still_only_switches(self):
+        """只念名字不能凭空填分。"""
+        self.state.handle_text("赵磊")
+        self.assertEqual(self.state.current.name, "赵磊")
+        self.assertEqual(self._scores(), [None] * 4)
+
+    def test_scores_without_name_need_a_current_student(self):
+        """idle 阶段只念分数、又没有当前学生时，要说清楚而不是崩。"""
+        r = self.state.handle_text("第一题十分")
+        self.assertFalse(r.ok)
+        self.assertIsNone(self.state.current)
+
+
+class TestPinyinSimilarity(unittest.TestCase):
+    """按字比声母韵母：整串比会把「村你/孙丽」这种模糊音结构丢掉。"""
+
+    def test_fuzzy_initials_and_finals(self):
+        """c↔s、n↔l 是普通话最常混的几组，韵母完全相同时要给高分。"""
+        self.assertGreater(parser.pinyin_similarity("村你", "孙丽"), 0.7)
+
+    def test_identical_pronunciation_scores_one(self):
+        for a, b in (("正好", "郑浩"), ("例四", "李四"), ("沉静", "陈静")):
+            self.assertAlmostEqual(parser.pinyin_similarity(a, b), 1.0,
+                                   delta=0.01, msg=f"{a}/{b}")
+
+    def test_different_people_score_low(self):
+        """不同的人必须拉开距离，否则会把分数填到别人那行。"""
+        for a, b in (("张三", "李四"), ("刘洋", "陈静"),
+                     ("王小明", "赵磊"), ("吴敏", "周杰")):
+            self.assertLess(parser.pinyin_similarity(a, b), 0.35,
+                            msg=f"{a}/{b}")
+
+    def test_length_mismatch_penalised(self):
+        """「张三」不能蹭上「张三丰」，否则三个字的名字永远选不中。"""
+        self.assertLess(parser.pinyin_similarity("张三", "张三丰"), 0.8)
+
+    def test_handles_empty_and_non_chinese(self):
+        for a, b in (("", "张三"), ("abc", "张三"), ("张三", "")):
+            v = parser.pinyin_similarity(a, b)
+            self.assertGreaterEqual(v, 0.0)
+            self.assertLessEqual(v, 1.0)
+
+    def test_threshold_separates_real_cases(self):
+        """实测样本：该纠的过阈值，不该纠的不过。"""
+        th = parser._NAME_FIX_THRESHOLD
+        for got, want in (("村你", "孙丽"), ("正好", "郑浩"), ("五米", "吴敏")):
+            self.assertGreaterEqual(parser.pinyin_similarity(got, want), th,
+                                    msg=f"{got}->{want} 应该能纠回来")
+        for got, want in (("张三", "李四"), ("刘洋", "陈静")):
+            self.assertLess(parser.pinyin_similarity(got, want), th,
+                            msg=f"{got}->{want} 不该被纠")

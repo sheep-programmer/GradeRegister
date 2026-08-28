@@ -28,6 +28,67 @@ SILENT_LEVEL = 0.01
 SILENT_WARN_AFTER = 4.0
 
 
+# 试探采样率的顺序：先要 16k（识别模型的原生采样率，不用重采样最干净），
+# 再退到设备原生，最后是几个常见值
+_FALLBACK_RATES = (48000, 44100, 32000, 22050, 8000)
+
+
+def pick_samplerate(sd, device, want: int = 16000) -> int:
+    """挑一个这台设备真的打得开的采样率。
+
+    Windows 的 MME/DirectSound 常常不支持 16kHz：PortAudio 要么直接报错，
+    要么给一路全是 0 的静音流。而挑麦克风时用的是设备原生采样率，所以那
+    一步有声音，一到正式录音就什么都收不到。
+    """
+    candidates = [want]
+    try:
+        idx = device if device is not None else sd.default.device[0]
+        native = int(sd.query_devices(idx).get("default_samplerate") or 0)
+        if native:
+            candidates.append(native)
+    except Exception:  # noqa: BLE001
+        pass
+    candidates.extend(_FALLBACK_RATES)
+
+    seen = set()
+    for rate in candidates:
+        rate = int(rate or 0)
+        if rate <= 0 or rate in seen:
+            continue
+        seen.add(rate)
+        try:
+            sd.check_input_settings(device=device, samplerate=rate,
+                                    channels=1, dtype="int16")
+            return rate
+        except Exception:  # noqa: BLE001
+            continue
+    return want          # 都开不了就照原样交给上层，让它正常报错
+
+
+def resample_to(audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    """把音频重采样到目标采样率。
+
+    降采样时先按整数倍做滑动平均压掉高频，再线性插值，
+    否则混叠会把人声搅成噪声。
+    """
+    if src_rate == dst_rate or audio.size == 0:
+        return audio
+    if src_rate > dst_rate:
+        k = int(src_rate // dst_rate)
+        if k > 1:
+            pad = (-len(audio)) % k
+            if pad:
+                audio = np.concatenate(
+                    [audio, np.zeros(pad, dtype=audio.dtype)])
+            audio = audio.reshape(-1, k).mean(axis=1)
+            src_rate = src_rate / k
+    if abs(src_rate - dst_rate) < 1e-6:
+        return audio.astype(np.float32)
+    n = max(1, int(round(len(audio) * dst_rate / src_rate)))
+    return np.interp(np.linspace(0, len(audio) - 1, n),
+                     np.arange(len(audio)), audio).astype(np.float32)
+
+
 def block_rms(block: np.ndarray) -> float:
     """一块归一化音频（0~1 量纲）的 RMS 音量；空块返回 0。"""
     return float(np.sqrt(np.mean(np.square(block)))) if block.size else 0.0
@@ -81,8 +142,12 @@ class AutoGain:
     def apply(self, block: np.ndarray) -> np.ndarray:
         """放大一块 0~1 归一化音频，返回可直接喂给识别引擎的 int16 数据。"""
         peak = float(np.max(np.abs(block))) if block.size else 0.0
-        self.update(peak)
-        return np.clip(block * self.gain * 32768.0,
+        gain = self.update(peak)
+        # 本块就要防削顶。update() 察觉削顶后调低的是「下一块」的增益，
+        # 这一块早已被削平——削顶是硬失真，识别率掉得比音量不足更狠
+        if peak > 0:
+            gain = min(gain, self.CLIP_PEAK / peak)
+        return np.clip(block * gain * 32768.0,
                        -32768, 32767).astype(np.int16)
 
 
@@ -203,6 +268,15 @@ class Recorder:
 
         engine = self.engine
         engine.begin()
+        want_rate = int(self.cfg.get("sample_rate", 16000))
+        device = self.cfg.get("device")
+        # 设备不一定支持 16k（Windows 尤其常见），开不了就换个能开的，
+        # 录到的音频再降回引擎要的采样率
+        rate = pick_samplerate(sd, device, want_rate)
+        if rate != want_rate:
+            print(f"[voice] 设备不支持 {want_rate}Hz，改用 {rate}Hz 录音"
+                  f"（识别前会降回 {want_rate}Hz）", flush=True)
+        block_frames = max(1, int(round(rate * 0.2)))   # 每块固定 0.2 秒
         frames: List[bytes] = []
         levels: List[float] = []
         raw_levels: List[float] = []
@@ -218,6 +292,9 @@ class Recorder:
             if not self._recording:
                 raise sd.CallbackStop
             block = indata.astype(np.float32) / 32768.0   # 统一归一化到 0~1
+            if rate != want_rate:
+                block = resample_to(block.reshape(-1), rate,
+                                    want_rate).reshape(-1, 1)
             amplified = gain.apply(block)
             frames.append(amplified.tobytes())
             # 两种音量各有用途：放大后的给界面音量条（反映引擎实际听到的强度），
@@ -228,10 +305,9 @@ class Recorder:
 
         try:
             with sd.InputStream(
-                    samplerate=int(self.cfg.get("sample_rate", 16000)),
-                    channels=1, dtype="int16",
-                    device=self.cfg.get("device"),
-                    blocksize=3200, callback=callback):
+                    samplerate=rate, channels=1, dtype="int16",
+                    device=device, blocksize=block_frames,
+                    callback=callback):
                 while self._recording:
                     time.sleep(0.05)
                     if frames:

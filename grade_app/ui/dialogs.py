@@ -147,11 +147,14 @@ class SettingsDialog:
         for title, items in self.CHECKS:
             group = self._section(body, title)
             if title == "语音":
-                combo = self._field(group, "识别引擎", engine_var,
-                                    ["sense-voice", "sherpa", "vosk",
-                                     "faster-whisper"],
-                                    "sense-voice 最准，说完一句才出字；"
-                                    "sherpa 边说边出字；vosk 模型小")
+                # 只列这份程序里真能用的：打包版只带了 sense-voice，
+                # 把别的列出来，切过去就是「找不到 tokens.txt」且下载无效
+                engines = speech.available_engines(self.cfg)
+                combo = self._field(
+                    group, "识别引擎", engine_var, engines,
+                    "sense-voice 最准，说完一句才出字；"
+                    "sherpa 边说边出字；vosk 模型小"
+                    if len(engines) > 1 else "这份程序内置了 sense-voice 模型")
                 self._build_model_row(group, dlg, engine_var)
                 combo.bind("<<ComboboxSelected>>",
                            lambda _e: self._refresh_model_status())

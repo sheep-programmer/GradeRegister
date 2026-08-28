@@ -437,6 +437,10 @@ class SenseVoiceEngine:
             raise FileNotFoundError(f"未找到识别模型（{d} 下缺 model.int8.onnx 或 tokens.txt）")
         self._rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
             model=model, tokens=tokens, num_threads=2,
+            # 锁定中文：这是个中英日韩粤多语种模型，不指定就自动判语种，
+            # 「八分」「加三分」这类半秒短音频经常被判成英文，吐出
+            # tin / baten / smerton 这种拼音式英文，整句作废
+            language="zh",
             # 不做数字规范化：它会把「第三题九分」并成「第39分」，
             # 中文数字交给解析器处理更稳
             use_itn=False)
@@ -486,12 +490,49 @@ def _strip_tags(text: str) -> str:
     return text.strip().strip("。，！？、 ")
 
 
+ALL_ENGINES = ("sense-voice", "sherpa", "vosk", "faster-whisper")
+
+
+def available_engines(cfg: dict) -> List[str]:
+    """当前这份程序里真正能用起来的引擎。
+
+    打包版只随程序带了 sense-voice：sherpa 的模型要跟着仓库分发、
+    faster-whisper 与 vosk 的依赖没打进去。把它们照旧列在设置里，
+    老师切过去只会撞上「找不到 tokens.txt」而且点下载也没反应。
+    """
+    out = ["sense-voice"]          # 内置，缺了也能自动下载
+    try:
+        sherpa_model_dir(cfg)
+        out.append("sherpa")
+    except FileNotFoundError:
+        pass
+    if importlib.util.find_spec("vosk") is not None:
+        out.append("vosk")
+    if importlib.util.find_spec("faster_whisper") is not None:
+        out.append("faster-whisper")
+    return out
+
+
+def resolve_engine(cfg: dict) -> str:
+    """把配置里的引擎名收敛到一个真能用的。
+
+    老配置里可能存着现在用不了的引擎（换过版本、或换到打包版），
+    直接拿去建引擎会一路报错到界面上。
+    """
+    engine = cfg.get("engine", "sense-voice")
+    usable = available_engines(cfg)
+    return engine if engine in usable else usable[0]
+
+
 def create_engine(cfg: dict):
     """按配置创建语音引擎；缺模型/依赖时自动回退。
 
     回退链：sense-voice → sherpa → faster-whisper（若已装）→ vosk。
     """
-    engine_name = cfg.get("engine", "sense-voice")
+    engine_name = resolve_engine(cfg)
+    if engine_name != cfg.get("engine", "sense-voice"):
+        print(f"[warn] 引擎 {cfg.get('engine')} 在这份程序里不可用，"
+              f"改用 {engine_name}", file=sys.stderr)
     sr = int(cfg.get("sample_rate", 16000))
     if engine_name == "sense-voice":
         try:

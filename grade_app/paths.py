@@ -50,3 +50,24 @@ def user_data_dir() -> str:
     except OSError:
         return os.path.expanduser("~")
     return path
+
+
+def log_path() -> str:
+    """运行日志的位置。打包成窗口程序后没有控制台，出了问题只能看它。"""
+    return os.path.join(user_data_dir(), "运行日志.txt")
+
+
+def start_file_logging() -> str:
+    """把标准输出接到日志文件；只在打包版生效，源码运行仍打到终端。
+
+    返回日志路径；接不上就返回空字符串，不影响程序启动。
+    """
+    if not is_frozen():
+        return ""
+    path = log_path()
+    try:
+        stream = open(path, "w", encoding="utf-8", buffering=1)
+    except OSError:
+        return ""
+    sys.stdout = sys.stderr = stream
+    return path

@@ -429,3 +429,125 @@ class TestRecorderGuards(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestClipGuard(unittest.TestCase):
+    """放大不能把波形削平：削顶是硬失真，识别率掉得比音量不足更狠。"""
+
+    def test_loud_block_is_not_clipped(self):
+        gain = AutoGain()
+        gain.calibrated = True
+        gain.gain = AutoGain.MAX_GAIN
+        block = (np.sin(np.linspace(0, 20, 3200)) * 0.63).astype(
+            np.float32).reshape(-1, 1)
+        out = gain.apply(block).astype(np.float32) / 32768.0
+        self.assertEqual(int((np.abs(out) >= 0.999).sum()), 0)
+
+    def test_quiet_block_still_amplified(self):
+        """防削顶不能顺手把正常放大也压掉。"""
+        gain = AutoGain()
+        gain.calibrated = True
+        gain.gain = 4.0
+        block = np.full((3200, 1), 0.02, dtype=np.float32)
+        out = gain.apply(block).astype(np.float32) / 32768.0
+        self.assertAlmostEqual(float(np.max(out)), 0.08, delta=0.005)
+
+    def test_silence_does_not_divide_by_zero(self):
+        gain = AutoGain()
+        gain.calibrated = True
+        out = gain.apply(np.zeros((3200, 1), dtype=np.float32))
+        self.assertEqual(int(np.abs(out).max()), 0)
+
+
+class FakeInputStream48k(FakeInputStream):
+    """只在 48kHz 下工作的设备——Windows 上最常见的情形。"""
+
+    RATE = 48000
+
+    def __init__(self, samplerate=48000, **kw):
+        if samplerate != self.RATE:
+            raise RuntimeError(f"{samplerate} not supported")
+        super().__init__(samplerate=samplerate, **kw)
+
+
+class FakeSounddevice48k(types.ModuleType):
+    CallbackStop = type("CallbackStop", (Exception,), {})
+    InputStream = FakeInputStream48k
+
+    def __init__(self):
+        super().__init__("sounddevice")
+
+    class default:
+        device = (0, 1)
+
+    @staticmethod
+    def check_input_settings(device=None, samplerate=None, channels=1,
+                             dtype="int16"):
+        if samplerate != FakeInputStream48k.RATE:
+            raise RuntimeError("unsupported")
+
+    @staticmethod
+    def query_devices(idx=None):
+        return {"default_samplerate": 48000.0, "max_input_channels": 1}
+
+
+class TestRecordsOnDeviceThatRejects16k(unittest.TestCase):
+    """设备只认 48k 时也要能录到、能断句——这是 Windows 上没声音的根因。"""
+
+    def setUp(self):
+        self._real = sys.modules.get("sounddevice")
+        sys.modules["sounddevice"] = FakeSounddevice48k()
+
+    def tearDown(self):
+        if self._real is None:
+            sys.modules.pop("sounddevice", None)
+        else:
+            sys.modules["sounddevice"] = self._real
+
+    def test_still_hears_speech_and_cuts(self):
+        got = threading.Event()
+        heard = []
+
+        class Offline(FakeEngine):
+            streaming = False
+
+            def feed(self, pcm):
+                heard.append(len(pcm))
+                return ""
+
+        rec = Recorder({"sample_rate": 16000},
+                       lambda k, _p: k == "final" and got.set())
+        rec.engine = Offline(final="第一题十分")
+        self.assertTrue(rec.start(continuous=True))
+        try:
+            cut = got.wait(timeout=5.0)
+        finally:
+            rec.stop()
+            if rec._thread:
+                rec._thread.join(timeout=3.0)
+        self.assertTrue(cut, "设备只支持 48k 时录不到声音/不断句")
+        self.assertTrue(heard, "引擎没有收到任何音频")
+
+    def test_audio_is_downsampled_to_engine_rate(self):
+        """喂给引擎的必须已经是 16k，否则识别出来是一堆乱码。"""
+        sizes = []
+
+        class Offline(FakeEngine):
+            streaming = False
+
+            def feed(self, pcm):
+                sizes.append(len(pcm))
+                return ""
+
+        rec = Recorder({"sample_rate": 16000}, lambda *a: None)
+        rec.engine = Offline()
+        rec.start(continuous=False)
+        time.sleep(1.2)
+        rec.stop()
+        if rec._thread:
+            rec._thread.join(timeout=3.0)
+        total_samples = sum(sizes) // 2          # int16
+        # 1.2 秒左右的音频，按 16k 算约 19200 个采样点；
+        # 若没降采样会是 48k 的三倍，差距远超容差
+        self.assertLess(total_samples, 16000 * 2.2,
+                        f"喂进去 {total_samples} 个采样点，像是没降采样")

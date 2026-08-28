@@ -138,3 +138,75 @@ class TestEngineSelection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRecognizerLanguage(unittest.TestCase):
+    """必须锁定中文：多语种自动判语种会把短句判成英文。"""
+
+    def test_sense_voice_pins_chinese(self):
+        import inspect
+        from grade_app import speech
+        source = inspect.getsource(speech.SenseVoiceEngine.__init__)
+        self.assertIn('language="zh"', source)
+
+
+class TestMishearNumbers(unittest.TestCase):
+    """同音误听：「七分」常被听成「气氛」，「三分」听成「三粉」。"""
+
+    def test_qifen_reads_as_seven(self):
+        from grade_app import parser
+        self.assertEqual(parser.extract_scores("气氛"), [7.0])
+
+    def test_fen_homophones(self):
+        from grade_app import parser
+        self.assertEqual(parser.extract_scores("三粉"), [3.0])
+        self.assertEqual(parser.extract_scores("十份"), [10.0])
+
+    def test_common_name_char_not_rewritten(self):
+        """「芬」是常见人名用字，不能当成「分」改掉，否则点名会出错。"""
+        from grade_app import parser
+        self.assertIn("李芬", parser.match_student_names("李芬", ["李芬", "张三"]))
+
+
+class TestAvailableEngines(unittest.TestCase):
+    """只列真正能用起来的引擎——列出来又切不过去，比不列更糟。"""
+
+    def _cfg(self, model_dir):
+        return {"model_dir": model_dir, "engine": "sense-voice"}
+
+    def test_sense_voice_always_listed(self):
+        from grade_app import speech
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIn("sense-voice", speech.available_engines(self._cfg(d)))
+
+    def test_sherpa_hidden_without_its_model(self):
+        """打包版没带 sherpa 模型，列出来点了就报 tokens.txt 找不到。"""
+        from grade_app import speech
+        with tempfile.TemporaryDirectory() as d:
+            self.assertNotIn("sherpa", speech.available_engines(self._cfg(d)))
+
+    def test_sherpa_listed_when_model_present(self):
+        from grade_app import speech
+        with tempfile.TemporaryDirectory() as d:
+            sd = os.path.join(d, "sherpa", "sherpa-onnx-streaming-x")
+            os.makedirs(sd)
+            open(os.path.join(sd, "tokens.txt"), "w").close()
+            self.assertIn("sherpa", speech.available_engines(self._cfg(d)))
+
+    def test_never_empty(self):
+        from grade_app import speech
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(speech.available_engines(self._cfg(d)))
+
+    def test_unavailable_engine_falls_back(self):
+        """配置里存着 sherpa 但模型没了，要退回能用的，而不是一路崩到底。"""
+        from grade_app import speech
+        with tempfile.TemporaryDirectory() as d:
+            cfg = {"model_dir": d, "engine": "sherpa"}
+            self.assertEqual(speech.resolve_engine(cfg), "sense-voice")
+
+    def test_available_engine_kept(self):
+        from grade_app import speech
+        with tempfile.TemporaryDirectory() as d:
+            cfg = {"model_dir": d, "engine": "sense-voice"}
+            self.assertEqual(speech.resolve_engine(cfg), "sense-voice")

@@ -159,13 +159,14 @@ class AppState:
         先切换到该生，再把名字后面的分数直接填上。
         """
         assert self.model is not None
-        if self.current is None:
-            return self.select_student(text)
-
         # 「第三题」这类只有题号的句子不能进姓名匹配，
         # 否则「三」会把当前学生切成「张三」
         items = parser.extract_score_items(text, **self._score_kw())
         if items and all(v is None for _q, v in items):
+            if self.current is None:
+                return ActionResult(
+                    message="还没选中学生，先念名字或号码（例如「张三」「5号」）",
+                    ok=False)
             return self._fill_scores(text)
 
         # 整句本身能匹配到学生名字（如"李四"里的"四"会被当数字）-> 优先按名字处理。
@@ -191,8 +192,12 @@ class AppState:
                 return act  # 重名弹窗/没找到：先不填分
             fill = self._fill_scores(rest)
             act.message += f"；{fill.message}"
+            act.ok = fill.ok
             return act
 
+        if self.current is None:
+            # 既没匹配到名字，也还没有当前学生：当作在念名字，由它给出提示
+            return self.select_student(text)
         return self._fill_scores(text)
 
     def _fill_scores(self, text: str) -> ActionResult:
@@ -516,7 +521,9 @@ class AppState:
                 text = corrected
 
         if self.phase == "idle":
-            result = self.select_student(text)
+            # 走 add_scores 而不是 select_student：老师常一句话连着念
+            # 「赵磊第一题十分第二题十二分」，只认名字会把分数全丢掉
+            result = self.add_scores(text)
         elif self.phase == "scoring":
             result = self.add_scores(text)
         elif self.phase == "total":

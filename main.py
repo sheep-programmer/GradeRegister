@@ -85,7 +85,9 @@ def _check_model(engine: str, cfg: dict, speech) -> bool:
 
 
 def main() -> int:
+    from grade_app import paths
     from grade_app.platform_support import ensure_utf8_output
+    paths.start_file_logging()  # 打包版没有控制台，日志先落盘
     ensure_utf8_output()        # 先理顺编码，否则 Windows 上第一句中文就崩
 
     args = sys.argv[1:]

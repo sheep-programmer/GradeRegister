@@ -482,7 +482,71 @@ def _pinyin(s: str) -> str:
         return ""
 
 
-_NAME_FIX_THRESHOLD = 0.62   # 拼音相似度达标即认定为念了该学生的名字
+# 平翘舌、鼻边音等：普通话口音与识别结果最常混的几组声母
+_FUZZY_INITIALS = ({"zh", "z"}, {"ch", "c"}, {"sh", "s"},
+                   {"n", "l"}, {"f", "h"}, {"r", "l"}, {"j", "z"})
+# 前后鼻音
+_FUZZY_FINALS = ({"an", "ang"}, {"en", "eng"}, {"in", "ing"},
+                 {"ian", "iang"}, {"uan", "uang"}, {"uen", "ueng"})
+# 声母认错的多、韵母听着稳，所以韵母占大头
+_INITIAL_WEIGHT = 0.35
+_FINAL_WEIGHT = 0.65
+
+
+def _split_syllables(s: str) -> tuple:
+    """把词拆成 (声母列表, 韵母列表)，逐字对齐用。"""
+    if _lazy_pinyin is None:
+        return (), ()
+    try:
+        from pypinyin import Style
+        return (tuple(_lazy_pinyin(s, style=Style.INITIALS, strict=False)),
+                tuple(_lazy_pinyin(s, style=Style.FINALS, strict=False)))
+    except Exception:  # noqa: BLE001
+        return (), ()
+
+
+def _fuzzy_equal(a: str, b: str, groups) -> bool:
+    return a == b or any(a in g and b in g for g in groups)
+
+
+def _syllable_similarity(i1: str, f1: str, i2: str, f2: str) -> float:
+    """单个字的发音相似度。"""
+    if i1 == i2:
+        si = 1.0
+    elif _fuzzy_equal(i1, i2, _FUZZY_INITIALS):
+        si = 0.6
+    else:
+        si = 0.0
+    if f1 == f2:
+        sf = 1.0
+    elif _fuzzy_equal(f1, f2, _FUZZY_FINALS):
+        sf = 0.8
+    else:
+        sf = difflib.SequenceMatcher(None, f1, f2).ratio() * 0.5
+    return _INITIAL_WEIGHT * si + _FINAL_WEIGHT * sf
+
+
+def pinyin_similarity(a: str, b: str) -> float:
+    """两个词读音有多像（0~1），逐字对齐比声母与韵母。
+
+    整串拼音直接算编辑距离会把结构丢掉：「村你」和「孙丽」韵母完全相同
+    （un-i），只差 c↔s、n↔l 两组模糊音，按字比就是 0.86，按串比只有 0.60。
+    字数不同时按较长的那个折算，避免「张」蹭上「张三丰」。
+    """
+    ia, fa = _split_syllables(a)
+    ib, fb = _split_syllables(b)
+    if not ia or not ib:
+        return 0.0
+    n = min(len(ia), len(ib))
+    total = sum(_syllable_similarity(ia[k], fa[k], ib[k], fb[k])
+                for k in range(n))
+    return total / max(len(ia), len(ib))
+
+
+# 拼音相似度达标即认定为念了该学生的名字。
+# 0.55 是按 180 条带噪样本扫出来的：再低就开始把甲纠成乙——
+# 填错人比没认出来严重得多，宁可让老师重念一次
+_NAME_FIX_THRESHOLD = 0.55
 # 最佳与次佳差距小于此值就算听不出区别（班上同时有「刘洋」「刘阳」），
 # 这时不擅自改写文本，留给候选框让老师点
 _NAME_AMBIGUOUS_GAP = 0.08
@@ -495,8 +559,7 @@ def rank_names_by_pinyin(token: str, names: Iterable[str],
     prefer（一般是还没录完的学生）只在相似度几乎相同时用作裁决：
     老师很少回头重录，但确实会回头改分，所以不做排除、只做裁决。
     """
-    t_py = _pinyin(token)
-    if not t_py or len(token) < 2:
+    if len(token) < 2 or _lazy_pinyin is None:
         return []
     prefer_set = {str(p).strip() for p in prefer}
     scored = []
@@ -504,8 +567,7 @@ def rank_names_by_pinyin(token: str, names: Iterable[str],
         n = str(n).strip()
         if len(n) < 2:
             continue
-        r = difflib.SequenceMatcher(None, t_py, _pinyin(n)).ratio()
-        scored.append((n, r))
+        scored.append((n, pinyin_similarity(token, n)))
     # 同分时未录完的排前面：sorted 稳定，先按偏好分桶再按相似度排
     scored.sort(key=lambda nr: (-nr[1], nr[0] not in prefer_set))
     return scored
@@ -613,4 +675,8 @@ def correct_headers_in_text(text: str, headers: Iterable[str],
 _MISHEAR_TO_NUM = str.maketrans({
     "时": "十", "是": "十", "石": "十", "识": "十", "拾": "十",
     "斯": "四", "丝": "四", "私": "四",
+    "气": "七", "齐": "七", "起": "七",
+    # 「分」的同音：七分常被听成「气氛」，三分听成「三粉」。
+    # 「芬」不收——它是常见人名用字（李芬），改了会伤到点名
+    "氛": "分", "粉": "分", "份": "分",
 })
