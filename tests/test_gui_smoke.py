@@ -494,5 +494,26 @@ class TestMainWindow(unittest.TestCase):
         self.assertIsNone(saved.call_args.args[0]["device"])
 
 
+    def test_unclear_name_does_not_block_with_a_modal(self):
+        """没听清时只提示+高亮，绝不能弹模态窗——那会把后面的语音全堵住。"""
+        with mock.patch.object(self.app, "_show_choice_dialog") as modal:
+            self.app._on_text("旺财")
+        modal.assert_not_called()
+        self.assertTrue(self.app.state._pending_choices)
+
+    def test_duplicate_name_still_uses_modal(self):
+        """重名必须挑一个，仍然走模态窗。"""
+        with mock.patch.object(self.app, "_show_choice_dialog") as modal:
+            self.app._on_text("张三")          # fixture 里张三重名
+        modal.assert_called()
+
+    def test_voice_picks_a_candidate(self):
+        self.app._on_text("旺财")
+        picks = self.app.state._pending_choices
+        self.assertTrue(picks)
+        self.app._on_text("第一个")
+        self.assertEqual(self.app.state.current.name, picks[0][1])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1202,3 +1202,90 @@ class TestScoreTextInState(unittest.TestCase):
         r = self.state.handle_text("十三分")
         self.assertIsNone(self.state.current)
         self.assertFalse(r.ok)
+
+
+class TestDuplicateNamesDoNotBlockCorrection(unittest.TestCase):
+    """班里有重名时，拼音纠错不能因此瘫掉。
+
+    同名两位的拼音必然一模一样，那是重名、该交给候选框按行选，
+    不是「听不清是甲还是乙」——把它当歧义会让整条纠错通道失效。
+    """
+
+    DUP = ["王小明", "李四", "张伟", "张三", "孙丽", "张三"]
+
+    def test_corrects_even_with_duplicates(self):
+        text, fixed = parser.correct_names_in_text("长三", self.DUP)
+        self.assertEqual(text, "张三", f"重名把纠错挡住了：{fixed}")
+        self.assertTrue(fixed)
+
+    def test_same_name_twice_is_not_ambiguous(self):
+        self.assertFalse(parser.is_name_ambiguous("长三", self.DUP))
+
+    def test_genuinely_close_names_still_ambiguous(self):
+        """真正发音相近的两个不同名字，仍然要判为分不清。"""
+        self.assertTrue(parser.is_name_ambiguous("刘扬", ["刘洋", "刘阳", "王五"]))
+
+    def test_ranking_lists_each_name_once(self):
+        ranked = parser.rank_names_by_pinyin("长三", self.DUP)
+        names = [n for n, _ in ranked]
+        self.assertEqual(len(names), len(set(names)))
+
+    def test_duplicate_still_offers_row_choice(self):
+        """纠对之后，两行同名仍然要让老师选是哪一行。"""
+        students = [(i, n) for i, n in enumerate(self.DUP)]
+        rows = parser.find_student_rows("张三", students)
+        self.assertEqual(len(rows), 2)
+
+
+class TestMisheardQuestionHead(unittest.TestCase):
+    """「题」常被听成「期」，题号丢了整句分数就落到错的列上。"""
+
+    def test_qi_reads_as_ti(self):
+        self.assertEqual(parser.extract_score_items("第二期八分"), [(2, 8.0)])
+        self.assertEqual(parser.extract_score_items("第五期六分"), [(5, 6.0)])
+
+    def test_several_in_one_breath(self):
+        got = parser.extract_score_items("第一期八分第二期七分第三期九分")
+        self.assertEqual(got, [(1, 8.0), (2, 7.0), (3, 9.0)])
+
+    def test_normal_ti_unaffected(self):
+        self.assertEqual(parser.extract_score_items("第二题八分"), [(2, 8.0)])
+
+    def test_qi_without_number_is_not_a_head(self):
+        """「星期」「学期」这类词里的「期」前面没有数字，不该被当题号。"""
+        self.assertEqual(parser.extract_score_items("这学期八分"),
+                         [(None, 8.0)])
+
+
+class TestNoOpRewriteIsNotAFix(unittest.TestCase):
+    """重念同一个分数（值没变）不该记成「修正」，也不该占一次撤销。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "t.xlsx")
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["姓名", "第一题", "第二题", "总分"])
+        ws.append(["孙丽", "", "", ""])
+        wb.save(self.path)
+        self.state = AppState(cfg=CFG)
+        self.state.load(load_sheet(self.path, CFG, backup=False))
+        self.state.handle_text("孙丽")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_same_value_is_not_counted_as_fix(self):
+        self.state.handle_text("第一题八分")
+        depth = len(self.state.undo_stack)
+        r = self.state.handle_text("第一题八分")     # 同样的分数再念一遍
+        self.assertEqual(self.state.current.scores.get(1), 8.0)
+        self.assertNotIn("修正", r.message)
+        self.assertEqual(len(self.state.undo_stack), depth,
+                         "值没变却占了一次撤销")
+
+    def test_different_value_still_counts_as_fix(self):
+        self.state.handle_text("第一题八分")
+        r = self.state.handle_text("第一题九分")
+        self.assertEqual(self.state.current.scores.get(1), 9.0)
+        self.assertIn("修正", r.message)

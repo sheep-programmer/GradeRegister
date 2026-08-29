@@ -45,14 +45,15 @@ class TestSpeechGate(unittest.TestCase):
         self.assertTrue(gate.feed(0.02))
 
     def test_speech_does_not_lift_the_floor(self):
-        """一直说话时底噪估计不能被人声带上去，否则越说越听不见。"""
+        """一直说话时门槛不能被自己顶到听不见——这才是要守的底线。"""
         gate = SpeechGate()
         for _ in range(50):
             gate.feed(0.001)
-        quiet = gate.threshold()
         for _ in range(200):
             gate.feed(0.09)
-        self.assertLess(gate.threshold(), quiet * 3)
+        self.assertTrue(gate.feed(0.09),
+                        "连着说了很久，同样音量的人声还得认得出来")
+        self.assertLessEqual(gate.threshold(), SpeechGate.CEILING)
 
     def test_follows_noise_down_quickly(self):
         """从吵的地方换到安静处，门槛要跟着降回来。"""
@@ -98,3 +99,45 @@ class TestMaxSegment(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGateSurvivesImmediateSpeech(unittest.TestCase):
+    """一按下就开口说话是最常见的用法，不能因此瘫掉。"""
+
+    def test_speech_from_the_very_first_block(self):
+        gate = SpeechGate()
+        heard = [gate.feed(0.05) for _ in range(8)]
+        self.assertTrue(all(heard),
+                        "开头就说话时每一块都该判成人声，否则永远等不到「说完」")
+
+    def test_silence_after_immediate_speech_is_silence(self):
+        gate = SpeechGate()
+        for _ in range(8):
+            gate.feed(0.05)
+        self.assertFalse(gate.feed(0.002), "说完之后的静音要能判出来")
+
+    def test_speech_does_not_poison_the_floor(self):
+        """人声不能被当成底噪，否则门槛被自己顶上去。"""
+        gate = SpeechGate()
+        for _ in range(20):
+            gate.feed(0.06)
+        self.assertLess(gate.threshold(), 0.06,
+                        "说了一长串之后，门槛不该高到连自己都听不见")
+
+    def test_still_adapts_to_a_noisy_room(self):
+        gate = SpeechGate()
+        for _ in range(60):
+            gate.feed(0.012)          # 持续底噪
+        self.assertFalse(gate.feed(0.012), "稳定底噪不该被当人声")
+        self.assertTrue(gate.feed(0.09), "吵归吵，人声还是要认出来")
+
+    def test_alternating_speech_and_pauses(self):
+        """真实说话是「说一句、停一下」，两种都要判对。"""
+        gate = SpeechGate()
+        for _ in range(3):
+            for _ in range(6):
+                gate.feed(0.0015)     # 句间停顿
+            speech = [gate.feed(0.05) for _ in range(6)]
+            self.assertTrue(all(speech))
+            pause = [gate.feed(0.0015) for _ in range(6)]
+            self.assertFalse(any(pause))

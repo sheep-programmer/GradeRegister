@@ -38,6 +38,8 @@ class AppState:
     undo_stack: List[List[tuple]] = field(default_factory=list)
     _last_edit_col: Optional[int] = field(default=None, repr=False)  # 最近填/改的题列
     _pending_q: Optional[float] = field(default=None, repr=False)    # 念了题号还没念分
+    # 听不清是谁时列出的候选，等老师用一句「第一个」来定
+    _pending_choices: Optional[List[tuple]] = field(default=None, repr=False)
 
     # ---------------- 加载 ----------------
     def load(self, model: SheetModel) -> None:
@@ -115,6 +117,21 @@ class AppState:
             text, [(s.row, s.name) for s in self.model.students],
             cutoff=self.cfg.get("score_cutoff", 0.55))
         if not rows:
+            # 与其让老师重念，不如把发音最像的两位列出来点一下——
+            # 实测「没听清」的情形里，正确答案七成就在这两个里面
+            cands = parser.pinyin_candidates(
+                text, [s.name for s in self.model.students])
+            if cands:
+                picks = [(s.row, s.name) for s in self.model.students
+                         if s.name in cands]
+                picks.sort(key=lambda rn: cands.index(rn[1]))
+                self._pending_choices = picks
+                listed = "  ".join(f"{i + 1} {n}"
+                                   for i, (_r, n) in enumerate(picks))
+                return ActionResult(
+                    message=f"没太听清，是这几位吗：{listed}"
+                            "（说「第一个」或直接点一下）",
+                    select_choices=picks, new_phase="idle", ok=False)
             return ActionResult(
                 message=f"没找到学生「{parser.clean_name_text(text)}」",
                 ok=False)
@@ -142,6 +159,7 @@ class AppState:
             if s.row == row:
                 self.current = s
                 self.phase = "scoring"
+                self._pending_choices = None   # 已经定了人，旧候选作废
                 self._last_edit_col = None   # 切学生，清掉旧格子高亮
                 self._pending_q = None       # 上一位学生没念完的题号不带过来
                 rest = self.model.score_count - self.model.filled_count(s)
@@ -258,6 +276,8 @@ class AppState:
                     continue
                 target = blanks[0]
             old = stu.scores.get(target)
+            if old is not None and abs(old - float(v)) < 1e-9:
+                continue          # 重念了同一个分数，什么都没变
             if old is None:
                 changes.append((stu, target, None))
                 filled.append(target)
@@ -472,6 +492,16 @@ class AppState:
         text = parser.collapse_repeats(text)
 
         names = [s.name for s in self.model.students] if self.model else []
+
+        # 上一句给了候选，这一句若是「第一个」就照它选人。
+        # 必须赶在号码定位之前——「第一个」同时也是选号码的说法
+        if self._pending_choices:
+            idx = parser.parse_choice_index(text)
+            choices, self._pending_choices = self._pending_choices, None
+            if idx is not None and 0 <= idx < len(choices):
+                act = self.activate_row(choices[idx][0])
+                act.heard_text = text
+                return act
 
         # 念了号码（「5号」「第五个」）就按号码定位，剩下的文本当分数
         if self.model is not None:

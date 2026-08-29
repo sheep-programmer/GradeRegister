@@ -487,6 +487,10 @@ class GradeApp(tk.Tk):
             self.sheet.highlight_cells(row=cur_idx, column=target,
                                        bg=theme.PENDING_CELL, fg=theme.TEXT,
                                        redraw=False)
+        for row, _name in (self.state._pending_choices or []):
+            if row in row_to_idx:
+                self.sheet.highlight_rows(rows=[row_to_idx[row]],
+                                          bg=theme.PENDING_CELL, redraw=False)
         last = self.state._last_edit_col
         if last is not None:
             self.sheet.highlight_cells(row=cur_idx, column=last,
@@ -500,8 +504,13 @@ class GradeApp(tk.Tk):
         heard = result.heard_text or text
         self.lbl_partial.config(text=f"听到：{heard}")
         self.heard.append(heard)
-        if result.select_choices:
+        if result.select_choices and result.ok:
+            # 重名：必须挑一个才能往下走，用模态窗
             self._show_choice_dialog(result.select_choices)
+        elif result.select_choices:
+            # 只是没太听清：不弹窗挡住语音流，把候选高亮在表里，
+            # 老师说一句「第一个」就能定，也可以直接点那一行
+            self._notify(result.message, "warn")
         elif result.message:
             self._notify(result.message, "success" if result.ok else "warn")
         self._after_action()

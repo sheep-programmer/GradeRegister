@@ -100,31 +100,46 @@ class SpeechGate:
     固定门槛只在安静房间成立。底噪一旦超过它，每一块都被当成人声，
     「最后一次听到声音」的时间被永久刷新，说完话永远等不到停顿——
     几句话会被连成一整段，界面上看就是「半天没反应」。
+
+    底噪取最近一段时间音量的低分位而不是滑动平均：老师往往一按下就
+    开口，平均值会被第一声直接带到人声的量级，之后整句话反而都被当成
+    静音；分位数天然把高的那部分排除在外。
     """
 
     FLOOR = SPEECH_LEVEL   # 再安静也不低于此，免得把电噪声当人声
+    # 门槛的上限。正常人声的 RMS 在 0.03 以上，门槛再怎么自适应也不能
+    # 越过这条线——否则窗口里恰好全是人声时，门槛会被顶到听不见自己
+    CEILING = 0.02
     MARGIN = 2.5           # 人声要高过底噪这么多倍
-    DECAY = 0.25           # 遇到更安静的立刻跟下去
-    RISE = 0.002           # 底噪只许缓慢抬升，防止说着说着把自己盖住
+    WINDOW = 60            # 参与估计的音频块数，约 12 秒
+    PERCENTILE = 20        # 取第几分位当底噪
+    MIN_SAMPLES = 5        # 样本太少时先用固定门槛
 
     def __init__(self) -> None:
-        self.noise: Optional[float] = None
+        self._recent: List[float] = []
+
+    @property
+    def noise(self) -> Optional[float]:
+        """当前的底噪估计；样本不足时为 None。"""
+        if len(self._recent) < self.MIN_SAMPLES:
+            return None
+        ordered = sorted(self._recent)
+        idx = min(len(ordered) - 1,
+                  len(ordered) * self.PERCENTILE // 100)
+        return ordered[idx]
 
     def threshold(self) -> float:
-        if self.noise is None:
+        noise = self.noise
+        if noise is None:
             return self.FLOOR
-        return max(self.FLOOR, self.noise * self.MARGIN)
+        return min(self.CEILING, max(self.FLOOR, noise * self.MARGIN))
 
     def feed(self, rms: float) -> bool:
-        """更新底噪估计并返回这一块是不是人声。"""
+        """记下这一块的音量并判断是不是人声。"""
         speech = rms >= self.threshold()
-        if self.noise is None:
-            self.noise = rms
-        elif rms < self.noise:
-            self.noise += (rms - self.noise) * self.DECAY
-        elif not speech:
-            # 只有判定为非人声时才允许抬高基线
-            self.noise += (rms - self.noise) * self.RISE
+        self._recent.append(rms)
+        if len(self._recent) > self.WINDOW:
+            del self._recent[0]
         return speech
 
 

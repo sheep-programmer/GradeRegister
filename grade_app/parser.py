@@ -75,7 +75,9 @@ def any_number_to_float(s: str) -> Optional[float]:
 # ---------------------------------------------------------------------------
 # 分数提取
 # ---------------------------------------------------------------------------
-_PREFIX_RE = re.compile(r"第?[零一二两三四五六七八九十百\d]+[题次体]")  # 「第三题」「第一次」「第一体」都剥离
+# 「第三题」「第一次」「第一体」「第二期」都剥离——「题」常被听成
+# 「期」「体」「次」，前面必须跟着数字，所以不会伤到「学期」这类词
+_PREFIX_RE = re.compile(r"第?[零一二两三四五六七八九十百\d]+[题次体期]")
 _SUFFIX_RE = re.compile(r"分+")
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -335,8 +337,8 @@ def _numbers_in_order(seg: str) -> List[float]:
 
 # 句首的题号允许丢掉「第」字（识别常吞掉它）；句中的必须带「第」，
 # 否则「再说一次十分」里的「一次」会被当成题号
-_HEAD_RE = re.compile(r"第?[零一二两三四五六七八九十百\d]+[题次]")
-_INNER_HEAD_RE = re.compile(r"第[零一二两三四五六七八九十百\d]+[题次]")
+_HEAD_RE = re.compile(r"第?[零一二两三四五六七八九十百\d]+[题次期]")
+_INNER_HEAD_RE = re.compile(r"第[零一二两三四五六七八九十百\d]+[题次期]")
 
 
 def is_numbered_header(header: str) -> bool:
@@ -383,7 +385,7 @@ def _head_matches(seg: str, header_map: dict) -> List[tuple]:
 
 
 def _head_number(head: str) -> Optional[float]:
-    raw = head.rstrip("题次").lstrip("第")
+    raw = head.rstrip("题次期").lstrip("第")
     return float(raw) if raw.isdigit() else cn_number_to_float(raw)
 
 
@@ -450,6 +452,43 @@ def extract_score_items(text: str, strip_prefix: bool = True,
                 for v in seg_vals:
                     items.append((q, v))
     return items
+
+
+# 列候选的下限。比它还低说明识别得离谱，硬凑候选只会打扰老师；
+# 实测「没听清」的情形里，正确答案七成落在发音最像的前两名
+_NAME_CANDIDATE_FLOOR = 0.35
+
+
+def pinyin_candidates(text: str, names: Iterable[str], limit: int = 2,
+                      floor: float = _NAME_CANDIDATE_FLOOR) -> List[str]:
+    """拿不准是谁时，按发音列出最像的几位供人工确认。
+
+    这条路专治「够像但不敢认」：直接猜会把分数填到别人那行，直接放弃
+    又要老师重念一遍。列出来让他一句话选，既不猜也不丢。
+    """
+    t = clean_name_text(text)
+    if not t or is_number_text(t):
+        return []
+    ranked = rank_names_by_pinyin(t, names)
+    return [n for n, r in ranked[:limit] if r >= floor]
+
+
+# 选候选的说法：「第一个」「第二个」「一」「二」都认
+_PICK_RE = re.compile(r"^第?\s*([零一二两三四五六七八九十\d]+)\s*(?:个|位|号)?$")
+
+
+def parse_choice_index(text: str) -> Optional[int]:
+    """把「第二个」这类说法解析成 0 基序号；不是选择就返回 None。"""
+    t = clean_name_text(text)
+    if not t:
+        return None
+    m = _PICK_RE.match(t)
+    if not m:
+        return None
+    v = any_number_to_float(m.group(1))
+    if v is None or v < 1 or v != int(v):
+        return None
+    return int(v) - 1
 
 
 def find_student_rows(text: str, students: List[tuple], cutoff: float = 0.45) -> List[tuple]:
@@ -550,8 +589,10 @@ def pinyin_similarity(a: str, b: str) -> float:
 # 填错人比没认出来严重得多，宁可让老师重念一次
 _NAME_FIX_THRESHOLD = 0.55
 # 最佳与次佳差距小于此值就算听不出区别（班上同时有「刘洋」「刘阳」），
-# 这时不擅自改写文本，留给候选框让老师点
-_NAME_AMBIGUOUS_GAP = 0.08
+# 这时不擅自改写文本，留给候选框让老师点。
+# 0.15 是实测扫出来的：再小会把「政委→张伟」这类听着更像错误答案的
+# 情况直接认下来，填到别人那行；放到这里正好转成候选让老师定
+_NAME_AMBIGUOUS_GAP = 0.15
 
 
 def rank_names_by_pinyin(token: str, names: Iterable[str],
@@ -565,10 +606,15 @@ def rank_names_by_pinyin(token: str, names: Iterable[str],
         return []
     prefer_set = {str(p).strip() for p in prefer}
     scored = []
+    seen = set()
     for n in names:
         n = str(n).strip()
-        if len(n) < 2:
+        # 同名只算一次：重名的两位拼音必然相同，留着会让「最佳与次佳
+        # 差距」恒为 0，被误判成听不清，整条纠错通道就废了。
+        # 具体是哪一行，交给候选框去选
+        if len(n) < 2 or n in seen:
             continue
+        seen.add(n)
         scored.append((n, pinyin_similarity(token, n)))
     # 同分时未录完的排前面：sorted 稳定，先按偏好分桶再按相似度排
     scored.sort(key=lambda nr: (-nr[1], nr[0] not in prefer_set))
