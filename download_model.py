@@ -32,7 +32,6 @@ def progress(done: int, total: int) -> None:
 # 少一个 spec 就会拒绝打包，所以 --all 必须把它们全下齐
 BUNDLED = (
     ("sense-voice", speech.download_sense_voice),
-    ("paraformer", speech.download_paraformer),
 )
 
 

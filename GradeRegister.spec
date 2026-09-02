@@ -18,9 +18,10 @@ IS_MAC = sys.platform == "darwin"
 # ---------------------------------------------------------------- 随包资源
 MODEL_FILES = ("model.int8.onnx", "tokens.txt")
 
-# 内置两个整句解码引擎：sense-voice（默认）与 paraformer（短句更快）
-# 目录名与 grade_app/speech.py 的 paraformer_dir() 保持一致
-bundled_models = ("sense-voice", "paraformer-zh")
+# 只打包默认引擎 sense-voice：它在这套点名+念分的场景里实测最准，
+# 多打一个 paraformer 要多 217MB 而绝大多数人不会去换。
+# 换引擎的人在设置里点「下载模型」，会下到用户目录（程序自身是只读的）
+bundled_models = ("sense-voice",)
 missing = []
 datas = []
 for sub in bundled_models:

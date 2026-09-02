@@ -33,10 +33,10 @@ VOSK_DIRNAME = "vosk-model-small-cn-0.22"
 
 
 def model_dir_path(cfg: dict) -> str:
-    """模型目录：打包版跟着程序走，源码运行在项目目录下。
+    """模型根目录：打包版跟着程序走，源码运行在项目目录下。
 
-    打包版里模型是随程序分发的只读资源；万一没打进去（自定义精简包），
-    回落到用户目录，让用户自己下载的模型仍能被找到。
+    只用于展示与整体定位。具体某个引擎的目录要用 engine_model_dir()，
+    它会逐个引擎判断该读随包的那份还是用户目录里可写的那份。
     """
     md = cfg.get("model_dir", "models")
     if os.path.isabs(md):
@@ -47,8 +47,25 @@ def model_dir_path(cfg: dict) -> str:
     return os.path.join(paths.user_data_dir(), md)
 
 
+def engine_model_dir(cfg: dict, subdir: str) -> str:
+    """某个引擎的模型目录：随程序分发的那份优先，否则用户目录里可写的那份。
+
+    必须逐个引擎判断。看整个 models 目录存不存在是不够的——打包版只带了
+    默认引擎时那个目录是存在的，于是别的引擎也被指向程序包内，而程序自身
+    所在的位置是只读的（macOS 的 .app 包内、Windows 的 Program Files），
+    老师在设置里换引擎、点下载就会失败。
+    """
+    md = cfg.get("model_dir", "models")
+    if os.path.isabs(md):
+        return os.path.join(md, subdir)
+    bundled = os.path.join(paths.resource_dir(), md, subdir)
+    if os.path.isdir(bundled) or not paths.is_frozen():
+        return bundled
+    return os.path.join(paths.user_data_dir(), md, subdir)
+
+
 def vosk_model_path(cfg: dict) -> str:
-    return os.path.join(model_dir_path(cfg), cfg.get("vosk_model", VOSK_DIRNAME))
+    return engine_model_dir(cfg, cfg.get("vosk_model", VOSK_DIRNAME))
 
 
 def download_vosk_model(cfg: dict, progress=None) -> str:
@@ -440,6 +457,34 @@ PARAFORMER_FILES = (
 )
 
 
+_HF_HOST = "https://huggingface.co/"
+# huggingface.co 在国内常年慢或不通，这个镜像的路径与官方一一对应，
+# 换掉域名即可。环境变量 HF_ENDPOINT 优先，方便自带镜像的用户覆盖
+_HF_MIRRORS = ("https://hf-mirror.com/",)
+
+
+def download_urls(url: str) -> List[str]:
+    """一个下载地址的候选列表，按先后顺序尝试。
+
+    官方地址在前、镜像在后：能连上官方就用官方，连不上再退镜像，
+    而不是反过来——镜像的更新有滞后。
+    """
+    if not url.startswith(_HF_HOST):
+        return [url]
+    tail = url[len(_HF_HOST):]
+    env = os.environ.get("HF_ENDPOINT", "").strip().rstrip("/")
+    heads = [_HF_HOST]
+    if env:
+        heads.insert(0, env + "/")     # 用户指定的镜像最优先
+    heads += list(_HF_MIRRORS)
+    out = []
+    for head in heads:
+        candidate = head + tail
+        if candidate not in out:
+            out.append(candidate)
+    return out
+
+
 def _files_present(model_dir: str, files) -> bool:
     return all(os.path.isfile(os.path.join(model_dir, name))
                for name, _url, _size in files)
@@ -468,13 +513,23 @@ def _download_files(model_dir: str, files, progress=None) -> str:
                 got = min(blocks * block_size, total if total > 0 else _approx)
                 progress(min(_base + got, total_all), total_all)
 
-        try:
-            urllib.request.urlretrieve(url, tmp, reporthook=hook)
-        except BaseException:
-            # 断掉的残片留着会占几百 MB，而且下次重下要重来，直接清掉
-            if os.path.exists(tmp):
-                os.remove(tmp)
-            raise
+        last_error = None
+        for candidate in download_urls(url):
+            try:
+                urllib.request.urlretrieve(candidate, tmp, reporthook=hook)
+                last_error = None
+                break
+            except BaseException as exc:      # noqa: BLE001
+                # 断掉的残片留着会占几百 MB，而且下次重下要重来，直接清掉
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
+                last_error = exc
+                print(f"[voice] {candidate} 下载失败（{exc}），换下一个地址",
+                      flush=True)
+        if last_error is not None:
+            raise last_error
         os.replace(tmp, dst)
         done_before += approx
     if progress:
@@ -484,7 +539,7 @@ def _download_files(model_dir: str, files, progress=None) -> str:
 
 def paraformer_dir(cfg: dict) -> str:
     """模型目录，路径基于项目目录解析，从任意工作目录启动都找得到。"""
-    return os.path.join(model_dir_path(cfg), "paraformer-zh")
+    return engine_model_dir(cfg, "paraformer-zh")
 
 
 def paraformer_ready(cfg: dict) -> bool:
@@ -497,7 +552,7 @@ def download_paraformer(cfg: dict, progress=None) -> str:
 
 def sense_voice_dir(cfg: dict) -> str:
     """模型目录，路径基于项目目录解析，从任意工作目录启动都找得到。"""
-    return os.path.join(model_dir_path(cfg), "sense-voice")
+    return engine_model_dir(cfg, "sense-voice")
 
 
 def sense_voice_ready(cfg: dict) -> bool:

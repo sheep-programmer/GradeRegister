@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -113,6 +114,161 @@ class TestModelPaths(unittest.TestCase):
         """从任意工作目录启动都要找得到模型。"""
         cfg = dict(DEFAULT_CONFIG)
         self.assertTrue(os.path.isabs(speech.sense_voice_dir(cfg)))
+
+
+class TestDownloadMirrors(unittest.TestCase):
+    """huggingface.co 国内常年慢或不通，要能自动退到镜像。"""
+
+    def test_official_comes_first(self):
+        url = speech.SENSE_VOICE_FILES[0][1]
+        candidates = speech.download_urls(url)
+        self.assertEqual(candidates[0], url,
+                         "官方地址要排第一：镜像的更新有滞后")
+        self.assertGreater(len(candidates), 1, "没有备用地址")
+
+    def test_mirror_keeps_the_same_path(self):
+        url = speech.SENSE_VOICE_FILES[0][1]
+        tail = url.split("huggingface.co/", 1)[1]
+        for candidate in speech.download_urls(url)[1:]:
+            self.assertTrue(candidate.endswith(tail),
+                            f"镜像路径和官方不一致: {candidate}")
+
+    def test_hf_endpoint_wins(self):
+        url = speech.SENSE_VOICE_FILES[0][1]
+        with mock.patch.dict(os.environ,
+                             {"HF_ENDPOINT": "https://mine.example.com"}):
+            first = speech.download_urls(url)[0]
+        self.assertTrue(first.startswith("https://mine.example.com/"))
+
+    def test_non_huggingface_urls_are_left_alone(self):
+        self.assertEqual(speech.download_urls(speech.VOSK_URL),
+                         [speech.VOSK_URL])
+
+    def test_falls_back_to_the_mirror(self):
+        """官方连不上就换下一个地址，别直接判死。"""
+        import urllib.error
+        tried = []
+
+        def fake(url, tmp, reporthook=None):
+            tried.append(url)
+            if "huggingface.co" in url:
+                raise urllib.error.URLError("模拟不通")
+            with open(tmp, "wb") as f:
+                f.write(b"x")
+            return tmp, None
+
+        folder = tempfile.mkdtemp()
+        try:
+            with mock.patch("urllib.request.urlretrieve", fake):
+                speech._download_files(
+                    folder, (("tokens.txt", speech.SENSE_VOICE_FILES[1][1],
+                              1000),))
+            self.assertTrue(
+                os.path.isfile(os.path.join(folder, "tokens.txt")))
+            self.assertGreaterEqual(len(tried), 2)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_all_addresses_failing_still_raises(self):
+        import urllib.error
+
+        def always_fail(url, tmp, reporthook=None):
+            raise urllib.error.URLError("都不通")
+
+        folder = tempfile.mkdtemp()
+        try:
+            with mock.patch("urllib.request.urlretrieve", always_fail):
+                with self.assertRaises(urllib.error.URLError):
+                    speech._download_files(
+                        folder, (("tokens.txt",
+                                  speech.SENSE_VOICE_FILES[1][1], 1000),))
+            self.assertFalse(os.path.exists(
+                os.path.join(folder, "tokens.txt.part")),
+                "失败后残片没清掉")
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+class TestBundledModelsMatchTheSpec(unittest.TestCase):
+    """spec 少一个模型就拒绝打包，所以 --all 的清单必须和它一致。"""
+
+    def test_spec_and_downloader_agree(self):
+        import pathlib
+        import re
+        import download_model
+        spec = pathlib.Path("GradeRegister.spec").read_text(encoding="utf-8")
+        found = re.search(r"bundled_models = \(([^)]*)\)", spec)
+        self.assertIsNotNone(found, "spec 里找不到 bundled_models")
+        in_spec = {part.strip().strip("\"'")
+                   for part in found.group(1).split(",") if part.strip()}
+        dirname = {"sense-voice": "sense-voice",
+                   "paraformer": "paraformer-zh"}
+        will_download = {dirname[name] for name, _fn in download_model.BUNDLED}
+        self.assertEqual(in_spec, will_download)
+
+
+class TestBundledAndDownloadedModelDirs(unittest.TestCase):
+    """打包版只带默认引擎：随包的读程序包内，别的引擎写用户目录。
+
+    看整个 models 目录存不存在是不够的——只带默认引擎时那个目录是存在的，
+    于是别的引擎也被指向程序包内，而那里是只读的（.app 包内、Program
+    Files），老师在设置里换引擎、点下载就会失败。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.bundle = os.path.join(self.tmp, "bundle")
+        self.home = os.path.join(self.tmp, "home")
+        # 打包版的样子：只有 sense-voice 被打进去了
+        os.makedirs(os.path.join(self.bundle, "models", "sense-voice"))
+        os.makedirs(self.home)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _frozen(self):
+        from tests.test_paths import FrozenContext
+        return FrozenContext(self.bundle)
+
+    def test_bundled_engine_reads_from_the_program(self):
+        cfg = {"model_dir": "models"}
+        with self._frozen(), \
+             mock.patch.dict(os.environ, {"HOME": self.home}):
+            self.assertTrue(speech.sense_voice_dir(cfg).startswith(self.bundle))
+
+    def test_unbundled_engine_lands_somewhere_writable(self):
+        cfg = {"model_dir": "models"}
+        with self._frozen(), \
+             mock.patch.dict(os.environ, {"HOME": self.home}):
+            target = speech.paraformer_dir(cfg)
+        self.assertFalse(
+            target.startswith(self.bundle),
+            f"paraformer 指到了只读的程序包内: {target}")
+        parent = os.path.dirname(target)
+        os.makedirs(parent, exist_ok=True)
+        probe = os.path.join(parent, ".probe")
+        with open(probe, "w") as f:      # 真写一下，确认可写
+            f.write("x")
+        os.remove(probe)
+
+    def test_unbundled_vosk_also_lands_writable(self):
+        cfg = {"model_dir": "models"}
+        with self._frozen(), \
+             mock.patch.dict(os.environ, {"HOME": self.home}):
+            self.assertFalse(
+                speech.vosk_model_path(cfg).startswith(self.bundle))
+
+    def test_running_from_source_uses_the_project_dir(self):
+        """源码运行时一切照旧，都在项目目录下。"""
+        cfg = {"model_dir": "models"}
+        for path in (speech.sense_voice_dir(cfg), speech.paraformer_dir(cfg)):
+            self.assertTrue(path.startswith(speech.model_dir_path(cfg)))
+
+    def test_absolute_model_dir_is_respected(self):
+        cfg = {"model_dir": self.tmp}
+        with self._frozen():
+            self.assertEqual(speech.paraformer_dir(cfg),
+                             os.path.join(self.tmp, "paraformer-zh"))
 
 
 class TestEngineSelection(unittest.TestCase):

@@ -42,15 +42,14 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # 两个引擎的模型都要，缺一个 GradeRegister.spec 会拒绝打包
+      # 只打包默认引擎；清单以 GradeRegister.spec 的 bundled_models 为准，
+      # 缺一个它会拒绝打包
       - name: 缓存语音模型
         id: models
         uses: actions/cache@v4
         with:
-          path: |
-            models/sense-voice
-            models/paraformer-zh
-          key: models-sense-voice-paraformer-v1
+          path: models/sense-voice
+          key: models-sense-voice-v1
 
       - name: 下载语音模型
         if: steps.models.outputs.cache-hit != 'true'
@@ -133,5 +132,9 @@ jobs:
 
             首次录音时系统会问麦克风权限，**必须点允许**。
 
-            语音模型（sense-voice 与 paraformer）已经打进程序，不用联网、
-            不用装 Python。
+            默认语音模型（sense-voice，最准的那个）已经打进程序，开箱就能用，
+            不用联网、不用装 Python。
+
+            想换 `paraformer`（短句更快）或 `vosk`（模型仅 42MB）的，在
+            「设置 → 语音」里选一下再点「下载模型」，会下到用户目录。
+            访问 huggingface 慢的话会自动改用镜像。
