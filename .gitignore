@@ -8,7 +8,12 @@ config.json
 gui_runtime.log
 backups/
 models/
+hotwords.txt
 :memory:*
+
+# 测试产物
+.coverage
+.pytest_cache/
 
 # 打包产物
 build/
