@@ -116,6 +116,86 @@ class TestModelPaths(unittest.TestCase):
         self.assertTrue(os.path.isabs(speech.sense_voice_dir(cfg)))
 
 
+class TestDownloadDirIsExplicit(unittest.TestCase):
+    """下载来的模型要有一个指定的目录，而且读写是同一个。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.bundle = os.path.join(self.tmp, "bundle")
+        self.chosen = os.path.join(self.tmp, "我的模型")
+        os.makedirs(os.path.join(self.bundle, "models", "sense-voice"))
+        os.makedirs(self.chosen)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _frozen(self):
+        from tests.test_paths import FrozenContext
+        return FrozenContext(self.bundle)
+
+    def test_configured_dir_is_where_it_downloads(self):
+        cfg = {"model_dir": "models", "download_dir": self.chosen}
+        with self._frozen():
+            self.assertEqual(speech.download_root(cfg), self.chosen)
+            self.assertEqual(speech.engine_model_location(cfg, "paraformer"),
+                             os.path.join(self.chosen, "paraformer-zh"))
+
+    def test_the_same_dir_is_used_to_read(self):
+        """写进去之后就该从那里读到，否则下了也白下。"""
+        cfg = {"model_dir": "models", "download_dir": self.chosen}
+        target = os.path.join(self.chosen, "paraformer-zh")
+        os.makedirs(target)
+        for name, _url, _size in speech.PARAFORMER_FILES:
+            open(os.path.join(target, name), "w").close()
+        with self._frozen():
+            self.assertEqual(speech.paraformer_dir(cfg), target)
+            self.assertTrue(speech.paraformer_ready(cfg))
+
+    def test_tilde_is_expanded(self):
+        cfg = {"model_dir": "models", "download_dir": "~/模型"}
+        self.assertTrue(os.path.isabs(speech.download_root(cfg)))
+        self.assertNotIn("~", speech.download_root(cfg))
+
+    def test_bundled_engine_ignores_the_setting(self):
+        """随包那份是只读的，改下载目录不该把它指走。"""
+        cfg = {"model_dir": "models", "download_dir": self.chosen}
+        with self._frozen():
+            self.assertTrue(speech.is_bundled_model(cfg, "sense-voice"))
+            self.assertTrue(
+                speech.sense_voice_dir(cfg).startswith(self.bundle))
+
+    def test_an_existing_copy_wins(self):
+        """已经下好的几百 MB 不能因为改了设置就变孤儿。"""
+        cfg = {"model_dir": "models", "download_dir": self.chosen}
+        with self._frozen():
+            self.assertTrue(
+                speech.engine_model_location(cfg, "sense-voice")
+                .startswith(self.bundle))
+
+    def test_blank_setting_falls_back_to_something_writable(self):
+        cfg = {"model_dir": "models", "download_dir": ""}
+        with self._frozen(), \
+             mock.patch.dict(os.environ, {"HOME": self.tmp}):
+            root = speech.download_root(cfg)
+        self.assertFalse(root.startswith(self.bundle),
+                         f"回落到了只读的程序包内: {root}")
+
+    def test_every_downloadable_engine_reports_a_location(self):
+        cfg = {"model_dir": "models"}
+        for engine in ("sense-voice", "paraformer", "vosk"):
+            self.assertTrue(speech.engine_model_location(cfg, engine),
+                            f"{engine} 说不出模型在哪")
+
+    def test_engines_that_manage_their_own_cache_report_nothing(self):
+        cfg = {"model_dir": "models"}
+        for engine in ("sherpa", "faster-whisper"):
+            self.assertEqual(speech.engine_model_location(cfg, engine), "")
+
+    def test_subdir_map_covers_the_engines_that_download(self):
+        for engine in ("sense-voice", "paraformer", "vosk"):
+            self.assertIn(engine, speech.ENGINE_SUBDIR)
+
+
 class TestDownloadMirrors(unittest.TestCase):
     """huggingface.co 国内常年慢或不通，要能自动退到镜像。"""
 

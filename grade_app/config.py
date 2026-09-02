@@ -28,6 +28,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # ---- 语音 ----
     "engine": "sense-voice",        # sense-voice（整句解码，最准，推荐）| paraformer（短句更快）| sherpa（边说边出字）| vosk | faster-whisper
     "model_dir": "models",
+    # 下载来的模型存到哪（也是之后读取的目录）。留空＝自动：源码运行放项目
+    # 的 models/，打包版放用户数据目录，因为程序自身所在的位置是只读的
+    "download_dir": "",
     "vosk_model": "vosk-model-small-cn-0.22",
     "whisper_model": "small",       # tiny/base/small
     "device": None,                 # 麦克风设备索引（None = 每次启动自动挑选）

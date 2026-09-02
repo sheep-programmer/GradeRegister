@@ -47,21 +47,47 @@ def model_dir_path(cfg: dict) -> str:
     return os.path.join(paths.user_data_dir(), md)
 
 
-def engine_model_dir(cfg: dict, subdir: str) -> str:
-    """某个引擎的模型目录：随程序分发的那份优先，否则用户目录里可写的那份。
+def download_root(cfg: dict) -> str:
+    """下载来的模型存到哪——也是之后读它的目录。
 
-    必须逐个引擎判断。看整个 models 目录存不存在是不够的——打包版只带了
-    默认引擎时那个目录是存在的，于是别的引擎也被指向程序包内，而程序自身
-    所在的位置是只读的（macOS 的 .app 包内、Windows 的 Program Files），
+    配置里指定了就用指定的。没指定时按运行方式选一个可写的地方：源码运行
+    放项目的 models/，打包版放用户数据目录，因为程序自身所在的位置是只读的
+    （macOS 的 .app 包内、Windows 的 Program Files）。
+    """
+    custom = str(cfg.get("download_dir") or "").strip()
+    if custom:
+        return os.path.abspath(os.path.expanduser(custom))
+    md = cfg.get("model_dir", "models")
+    if os.path.isabs(md):
+        return md
+    base = paths.user_data_dir() if paths.is_frozen() else paths.project_root()
+    return os.path.join(base, md)
+
+
+def engine_model_dir(cfg: dict, subdir: str) -> str:
+    """某个引擎的模型目录，读与写都用这一个。
+
+    必须逐个引擎判断，看整个 models 目录存不存在是不够的：打包版只带了
+    默认引擎时那个目录是存在的，于是别的引擎也被指向只读的程序包内，
     老师在设置里换引擎、点下载就会失败。
+
+    已经存在的那份优先，所以改了下载目录不会让先前下好的几百 MB 变成孤儿。
     """
     md = cfg.get("model_dir", "models")
     if os.path.isabs(md):
         return os.path.join(md, subdir)
     bundled = os.path.join(paths.resource_dir(), md, subdir)
-    if os.path.isdir(bundled) or not paths.is_frozen():
-        return bundled
-    return os.path.join(paths.user_data_dir(), md, subdir)
+    if os.path.isdir(bundled):
+        return bundled              # 随程序分发的那份
+    return os.path.join(download_root(cfg), subdir)
+
+
+def is_bundled_model(cfg: dict, subdir: str) -> bool:
+    """这个引擎的模型是随程序分发的（只读、不用下载）。"""
+    md = cfg.get("model_dir", "models")
+    if os.path.isabs(md):
+        return False
+    return os.path.isdir(os.path.join(paths.resource_dir(), md, subdir))
 
 
 def vosk_model_path(cfg: dict) -> str:
@@ -764,6 +790,25 @@ def engine_model_ready(cfg: dict, engine: Optional[str] = None) -> bool:
         except FileNotFoundError:
             return False
     return True     # faster-whisper 首次使用时自己下
+
+
+# 各引擎的模型目录名，供界面显示「存到哪」
+ENGINE_SUBDIR = {
+    "sense-voice": "sense-voice",
+    "paraformer": "paraformer-zh",
+    "vosk": VOSK_DIRNAME,
+}
+
+
+def engine_model_location(cfg: dict, engine: Optional[str] = None) -> str:
+    """这个引擎的模型在哪（未下载时就是将要下到哪）。"""
+    engine = engine or cfg.get("engine", "sense-voice")
+    subdir = ENGINE_SUBDIR.get(engine)
+    if subdir is None:
+        return ""            # sherpa 随项目自带、faster-whisper 自己管缓存
+    if engine == "vosk":
+        return vosk_model_path(cfg)
+    return engine_model_dir(cfg, subdir)
 
 
 def engine_model_status(cfg: dict, engine: Optional[str] = None) -> str:

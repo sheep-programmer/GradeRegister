@@ -1,10 +1,11 @@
 """弹窗：选择学生、设置、使用说明。统一套用主题令牌。"""
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Callable, List, Tuple
 
 from .. import platform_support, speech
@@ -198,6 +199,8 @@ class SettingsDialog:
                 "device": (None if mic_var.get() == "自动选择"
                            else int(mic_var.get().split(":")[0])),
                 "auto_save_mode": modes.get() or "checked",
+                # 「选择…」直接写在 self.cfg 上，这里带出去一并落盘
+                "download_dir": self.cfg.get("download_dir", ""),
                 "segment_gap": next(
                     (sec for sec, label in self.GAP_CHOICES
                      if label == gap_var.get()),
@@ -221,15 +224,36 @@ class SettingsDialog:
                          engine_var: tk.StringVar) -> None:
         self._dlg = dlg
         self._engine_var = engine_var
+        indent = theme.SPACE_XL + theme.SPACE_MD
         row = tk.Frame(parent, bg=theme.SURFACE)
-        row.pack(fill="x", padx=(theme.SPACE_XL + theme.SPACE_MD, 0))
+        row.pack(fill="x", padx=(indent, 0))
         self._lbl_model = tk.Label(row, text="", bg=theme.SURFACE,
                                    font=self.fonts.small, anchor="w")
         self._lbl_model.pack(side="left")
         self._btn_dl = ttk.Button(row, text="下载模型",
                                   command=self._download_model)
         self._dl_bar = ttk.Progressbar(row, length=170, maximum=100)
+
+        # 模型存到哪、也从哪读，明写出来：几百 MB 的东西不能不告诉人放哪了
+        where = tk.Frame(parent, bg=theme.SURFACE)
+        where.pack(fill="x", padx=(indent, 0), pady=(2, 0))
+        self._lbl_where = tk.Label(where, text="", bg=theme.SURFACE,
+                                   fg=theme.TEXT_FAINT, font=self.fonts.small,
+                                   anchor="w")
+        self._lbl_where.pack(side="left")
+        self._btn_pick = ttk.Button(where, text="选择…",
+                                    command=self._pick_download_dir)
+        self._btn_open = ttk.Button(where, text="打开",
+                                    command=self._open_download_dir)
         self._refresh_model_status()
+
+    def _download_dir_display(self) -> str:
+        """当前引擎的模型目录，尽量写成 ~ 开头，别撑爆一行。"""
+        path = speech.engine_model_location(self.cfg, self._engine_var.get())
+        if not path:
+            return ""
+        home = os.path.expanduser("~")
+        return "~" + path[len(home):] if path.startswith(home) else path
 
     def _refresh_model_status(self) -> None:
         engine = self._engine_var.get()
@@ -243,6 +267,48 @@ class SettingsDialog:
             self._btn_dl.pack_forget()
         else:
             self._btn_dl.pack(side="left", padx=(theme.SPACE_SM, 0))
+
+        path = self._download_dir_display()
+        subdir = speech.ENGINE_SUBDIR.get(engine)
+        bundled = bool(subdir) and speech.is_bundled_model(self.cfg, subdir)
+        self._btn_pick.pack_forget()
+        self._btn_open.pack_forget()
+        if not path:
+            self._lbl_where.config(
+                text="首次使用时下到它自带的缓存目录，位置由它自己决定"
+                if engine == "faster-whisper" else "模型随项目自带，无需下载")
+            return
+        self._lbl_where.config(
+            text=("随程序分发：" if bundled
+                  else "已存于：" if ready else "将下载到：") + path)
+        if bundled:
+            return          # 随包的那份是只读的，改目录也没用
+        self._btn_pick.pack(side="left", padx=(theme.SPACE_SM, 0))
+        if os.path.isdir(path if path.startswith("/")
+                         else os.path.expanduser(path)):
+            self._btn_open.pack(side="left", padx=(theme.SPACE_XS, 0))
+
+    def _pick_download_dir(self) -> None:
+        chosen = filedialog.askdirectory(
+            title="选择模型存放目录", parent=self._dlg,
+            initialdir=speech.download_root(self.cfg))
+        if not chosen:
+            return
+        if not os.access(chosen, os.W_OK):
+            messagebox.showerror("这个目录写不进去",
+                                 f"{chosen}\n\n换一个有写入权限的目录。",
+                                 parent=self._dlg)
+            return
+        self.cfg["download_dir"] = chosen
+        self._refresh_model_status()
+
+    def _open_download_dir(self) -> None:
+        path = speech.engine_model_location(self.cfg, self._engine_var.get())
+        target = path if os.path.isdir(path) else os.path.dirname(path)
+        try:
+            platform_support.open_in_default_app(target)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("打开失败", str(e), parent=self._dlg)
 
     def _download_model(self) -> None:
         engine = self._engine_var.get()

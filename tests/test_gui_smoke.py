@@ -1109,6 +1109,49 @@ class TestMainWindow(unittest.TestCase):
         self.assertEqual(saved.get("auto_save_mode"), "student")
         self.assertTrue(saved.get("auto_save"))
 
+    def test_settings_shows_where_the_model_lives(self):
+        """几百 MB 的东西不能不告诉人放哪了。"""
+        top, _saved = self._open_settings()
+        self.app.update_idletasks()
+        text = self._settings_dialog._lbl_where.cget("text")
+        top.destroy()
+        self.assertTrue(text.strip(), "没有显示模型目录")
+
+    def test_picking_a_dir_writes_it_back(self):
+        import os
+        import tempfile
+        chosen = tempfile.mkdtemp()
+        try:
+            top, saved = self._open_settings()
+            dlg = self._settings_dialog
+            with mock.patch.object(dialogs.filedialog, "askdirectory",
+                                   return_value=chosen):
+                dlg._pick_download_dir()
+            self.assertEqual(dlg.cfg["download_dir"], chosen)
+            top.destroy()
+        finally:
+            shutil.rmtree(chosen, ignore_errors=True)
+
+    def test_an_unwritable_dir_is_refused(self):
+        import os
+        import tempfile
+        readonly = tempfile.mkdtemp()
+        os.chmod(readonly, 0o500)
+        try:
+            top, _saved = self._open_settings()
+            dlg = self._settings_dialog
+            before = dlg.cfg.get("download_dir", "")
+            with mock.patch.object(dialogs.filedialog, "askdirectory",
+                                   return_value=readonly), \
+                 mock.patch.object(dialogs.messagebox, "showerror") as err:
+                dlg._pick_download_dir()
+            err.assert_called_once()
+            self.assertEqual(dlg.cfg.get("download_dir", ""), before)
+            top.destroy()
+        finally:
+            os.chmod(readonly, 0o700)
+            shutil.rmtree(readonly, ignore_errors=True)
+
     def test_settings_shows_model_ready(self):
         with mock.patch("grade_app.speech.engine_model_ready", return_value=True):
             top, _saved = self._open_settings()
