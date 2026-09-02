@@ -10,7 +10,7 @@ import unittest
 import numpy as np
 
 from grade_app.recorder import (SPEECH_LEVEL, AutoGain, Recorder, SegmentTimer,
-                                block_rms)
+                                block_rms, remove_dc)
 
 
 class TestAutoGain(unittest.TestCase):
@@ -412,6 +412,31 @@ class TestContinuousAutoCut(unittest.TestCase):
             cut_while_recording,
             "说完一句停顿 4 秒后仍未自动断句，只能靠手动停止才出结果")
         self.assertEqual(finals[0], "第一题十分")
+
+
+class TestRemoveDc(unittest.TestCase):
+    """录音块去直流：偏置声卡录出来的波形要回到零基线再喂给引擎。"""
+
+    def test_constant_offset_removed(self):
+        x = np.full((800, 1), 0.3, dtype=np.float32)
+        out = remove_dc(x)
+        self.assertAlmostEqual(float(out.mean()), 0.0, places=6)
+
+    def test_sine_keeps_waveform(self):
+        """去直流只消偏置，人声波形本身不能一起被抹掉。"""
+        t = np.linspace(0, 20, 3200)
+        x = (np.sin(t) + 0.5).astype(np.float32).reshape(-1, 1)
+        out = remove_dc(x)
+        self.assertAlmostEqual(float(out.mean()), 0.0, places=6)
+        self.assertGreater(float(np.abs(out).max()), 0.5)
+
+    def test_empty_block_passthrough(self):
+        empty = np.zeros((0, 1), dtype=np.float32)
+        self.assertIs(remove_dc(empty), empty)
+
+    def test_shape_preserved(self):
+        x = np.random.default_rng(1).normal(0, 0.1, (3200, 1)).astype(np.float32)
+        self.assertEqual(remove_dc(x).shape, (3200, 1))
 
 
 class TestRecorderGuards(unittest.TestCase):

@@ -47,6 +47,128 @@ class TestPinyinCandidates(unittest.TestCase):
         self.assertEqual(parser.pinyin_candidates("村你", []), [])
 
 
+class TestRankingReuseIsEquivalent(unittest.TestCase):
+    """纠错里名次只排一次，结论必须和分开排两次完全一样。
+
+    is_name_ambiguous 只看前两位的相似度，而 prefer 只在同分时重排顺序，
+    所以前两位的分数与 prefer 无关——这条等价性是「只排一次」的前提，
+    它一旦不成立，性能优化就会静默改掉纠错结果。
+    """
+
+    NAMES = ["张三", "李四", "王五", "赵磊", "刘洋", "刘阳", "纪旭", "钟芳",
+             "孙丽", "陈明", "周杰", "吴敏", "欧阳娜", "司马光"]
+
+    def _two_passes(self, token, prefer):
+        if parser.is_name_ambiguous(token, self.NAMES):
+            return None
+        return parser.best_name_by_pinyin(token, self.NAMES, prefer)
+
+    def _one_pass(self, token, prefer):
+        ranked = parser.rank_names_by_pinyin(token, self.NAMES, prefer)
+        if parser._ranking_is_ambiguous(ranked):
+            return None
+        return parser._best_from_ranking(ranked, prefer)
+
+    def test_equivalent_on_real_mishearings(self):
+        prefer = set(self.NAMES[:7])
+        for token in ("掌声", "五米", "刘扬", "村你", "又雷", "陈净", "正好",
+                      "州杰", "孙立", "雷斯", "第第", "滴滴", "欧阳那"):
+            self.assertEqual(self._two_passes(token, prefer),
+                             self._one_pass(token, prefer), token)
+
+    def test_equivalent_across_random_tokens_and_preferences(self):
+        import random
+        chars = "张李王赵刘纪钟孙陈周吴郑欧阳娜司马光三四五磊洋旭芳丽明杰敏"
+        random.seed(99)
+        for _ in range(3000):
+            token = "".join(random.choice(chars)
+                            for _ in range(random.randint(2, 4)))
+            prefer = set(random.sample(self.NAMES,
+                                       random.randint(0, len(self.NAMES))))
+            self.assertEqual(self._two_passes(token, prefer),
+                             self._one_pass(token, prefer),
+                             f"{token!r} prefer={sorted(prefer)}")
+
+    def test_top_two_scores_ignore_the_preference(self):
+        """等价性的根据：前两位的分数与 prefer 无关。"""
+        for token in ("掌声", "刘扬", "村你", "欧阳那"):
+            plain = parser.rank_names_by_pinyin(token, self.NAMES)
+            biased = parser.rank_names_by_pinyin(token, self.NAMES,
+                                                 self.NAMES[:5])
+            self.assertEqual([r for _n, r in plain[:2]],
+                             [r for _n, r in biased[:2]], token)
+
+
+class TestRepeatedCharNoise(unittest.TestCase):
+    """叠字噪声不许被纠成姓名。
+
+    噪声与口吃经 collapse_repeats 折叠后就是叠字（「第第第第」→「第第」）。
+    叠字两个音节完全相同，跟任何「声母不同、韵母相同」的姓名都算得很像
+    （didi vs lisi 有 0.65），而真实误听最低只有 0.58——两段区间重叠，
+    调阈值分不开，只能按结构挡。
+    """
+
+    NAMES = ["张三", "李四", "王五", "赵磊", "刘洋", "陈静",
+             "孙丽", "周杰", "吴敏", "郑浩"]
+    NOISE = ["第第", "第第第第", "滴滴", "地地", "题题", "你你", "米米",
+             "西西", "气气", "是是", "一一", "三三", "四四", "嘀嘀", "喂喂"]
+
+    def test_noise_is_never_rewritten_to_a_name(self):
+        for word in self.NOISE:
+            folded = parser.collapse_repeats(word)
+            out, fixed = parser.correct_names_in_text(folded, self.NAMES)
+            self.assertEqual(fixed, [], f"{word!r} 被改写成了 {out!r}")
+
+    def test_real_mishearings_still_get_fixed(self):
+        for got, want in (("掌声", "张三"), ("五米", "吴敏"), ("刘扬", "刘洋"),
+                          ("村你", "孙丽"), ("又雷", "赵磊"), ("陈净", "陈静"),
+                          ("正好", "郑浩"), ("州杰", "周杰")):
+            out, _fixed = parser.correct_names_in_text(got, self.NAMES)
+            self.assertEqual(out, want, f"{got} 应纠成 {want}，实际 {out}")
+
+    def test_a_roster_with_a_doubled_name_can_still_correct(self):
+        """名单里真有叠字姓名（莉莉）时，这条限制要放开。"""
+        names = ["莉莉", "张三", "李四"]
+        out, fixed = parser.correct_names_in_text("丽丽", names)
+        self.assertEqual(out, "莉莉")
+        self.assertTrue(fixed)
+
+    def test_a_doubled_name_matches_exactly_without_correction(self):
+        """就算不纠错，念对了也能精确命中——所以挡掉纠错不会漏人。"""
+        self.assertIn("丽丽", parser.match_student_names("丽丽",
+                                                        ["丽丽", "张三"]))
+
+    def test_noise_does_not_switch_the_current_student(self):
+        """端到端：正在录张三时说一句叠字噪声，不能把学生换掉。"""
+        import os
+        import shutil
+        import tempfile
+        from openpyxl import Workbook
+        from grade_app.excel_io import load_sheet
+        from grade_app.state import AppState
+        tmp = tempfile.mkdtemp()
+        try:
+            path = os.path.join(tmp, "t.xlsx")
+            wb = Workbook()
+            ws = wb.active
+            ws.append(["姓名", "第一题", "总分"])
+            for n in ("张三", "李四", "王五"):
+                ws.append([n, None, None])
+            wb.save(path)
+            cfg = {"auto_save_mode": "manual", "score_cutoff": 0.55}
+            st = AppState(cfg=cfg)
+            st.load(load_sheet(path, cfg, backup=False))
+            st.handle_text("张三")
+            self.assertEqual(st.current.name, "张三")
+            for word in ("第第第第", "滴滴", "你你", "是是"):
+                st.handle_text(word)
+                self.assertEqual(st.current.name, "张三",
+                                 f"说了 {word!r} 之后学生被换成了 "
+                                 f"{st.current.name}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class TestChoiceByVoice(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

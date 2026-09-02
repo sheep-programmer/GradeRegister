@@ -5,9 +5,10 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from grade_app import parser
-from grade_app.excel_io import load_sheet, save_sheet
+from grade_app.excel_io import check_mark_text, load_sheet, save_sheet
 from grade_app.state import AppState
 from openpyxl import Workbook
 
@@ -71,6 +72,13 @@ class TestExtractScores(unittest.TestCase):
     def test_mixed_text(self):
         got = parser.extract_scores("第一题十八分 第二题十二分")
         self.assertEqual(got, [18.0, 12.0])
+
+    def test_mishear_digit_homophones(self):
+        """同音字纠正：失→十、期→七、吧→八，听岔的分数仍能对上。"""
+        self.assertEqual(parser.extract_scores("失误"), [15.0])
+        self.assertEqual(parser.extract_scores("时期"), [17.0])
+        self.assertEqual(parser.extract_scores("是吧"), [18.0])
+        self.assertEqual(parser.extract_scores("第漆题三分"), [3.0])
 
 
 class TestExtractScoreItems(unittest.TestCase):
@@ -158,6 +166,18 @@ class TestHeaderScoreItems(unittest.TestCase):
 
     def test_no_headers_argument_keeps_old_behaviour(self):
         self.assertEqual(parser.extract_score_items("第三题九分"), [(3, 9.0)])
+
+    def test_header_survives_mishear_mapping(self):
+        """表头里的字也在同音映射里（实→十）时，匹配必须用原文。"""
+        self.assertEqual(
+            parser.extract_score_items("实验题七十二分", headers=["实验题"]),
+            [(1, 72.0)])
+
+    def test_physics_header_not_damaged_by_mishear_map(self):
+        """「误→五」这类映射只作用于数字提取，不能把表头改坏。"""
+        self.assertEqual(
+            parser.extract_score_items("物理七十二分", headers=["物理"]),
+            [(1, 72.0)])
 
 
 class TestHeaderPinyinCorrection(unittest.TestCase):
@@ -699,6 +719,88 @@ class TestState(unittest.TestCase):
         self.assertIs(self.state.current.checked, True)
         self.assertIn("一致", r.message)
 
+    def test_next_student_jumps_to_unfinished(self):
+        """当前学生录完后，指令切到名单里下一位还没录完的。"""
+        self.state.select_student("张三")
+        self.state.activate_row(1)
+        self.state.add_scores("第一题18分 第二题12分 第三题15分")
+        r = self.state.next_student()
+        self.assertTrue(r.ok)
+        self.assertEqual(self.state.current.name, "李四")
+        self.assertIn("李四", r.message)
+
+    def test_next_student_wraps_around(self):
+        """当前这位录完后，下一位未录的在名单开头时也能绕回去找到。"""
+        self.state.select_student("李四")
+        self.state.add_scores("第一题18分 第二题12分 第三题15分")
+        self.state.select_student("张三")
+        self.state.activate_row(3)     # 第二个张三也录完
+        self.state.add_scores("第一题18分 第二题12分 第三题15分")
+        r = self.state.next_student()  # 当前 row3，未录的只剩名单开头的 row1
+        self.assertTrue(r.ok)
+        self.assertEqual(self.state.current.name, "张三")
+        self.assertEqual(self.state.current.row, 1)
+
+    def test_next_student_all_done_message(self):
+        """全班录完后再念「下一个」：明确提示，不能再切。"""
+        for row in (1, 3):
+            self.state.select_student("张三")
+            self.state.activate_row(row)
+            self.state.add_scores("第一题18分 第二题12分 第三题15分")
+        self.state.select_student("李四")
+        self.state.add_scores("第一题18分 第二题12分 第三题15分")
+        r = self.state.next_student()
+        self.assertFalse(r.ok)
+        self.assertIn("全班都已录完", r.message)
+        self.assertIsNotNone(self.state.current)
+
+    def test_next_command_through_handle_text(self):
+        """「下一个」走统一输入入口时同样生效，界面回显原句。"""
+        self.state.select_student("张三")
+        self.state.activate_row(1)
+        self.state.add_scores("第一题18分 第二题12分 第三题15分")
+        r = self.state.handle_text("下一个")
+        self.assertEqual(self.state.current.name, "李四")
+        self.assertEqual(r.heard_text, "下一个")
+
+    def test_auto_next_after_total_check(self):
+        """打开 auto_next：核对一致后自动切到下一位未录学生。"""
+        st = AppState(cfg={**CFG, "auto_next": True})
+        st.load(load_sheet(self.path, CFG, backup=False))
+        st.select_student("张三")
+        st.activate_row(1)
+        st.add_scores("第一题18分 第二题12分 第三题15分")
+        r = st.check_total("总分45")
+        self.assertTrue(r.ok)
+        self.assertIn("已自动切到下一位：李四", r.message)
+        self.assertEqual(st.current.name, "李四")
+
+    def test_auto_next_stays_when_all_done(self):
+        """全录完后 auto_next 不再乱切，核对完留在当前学生。"""
+        st = AppState(cfg={**CFG, "auto_next": True})
+        st.load(load_sheet(self.path, CFG, backup=False))
+        st.select_student("李四")
+        st.add_scores("第一题18分 第二题12分 第三题15分")
+        st.select_student("张三")
+        st.activate_row(1)
+        st.add_scores("第一题18分 第二题12分 第三题15分")
+        st.select_student("张三")
+        st.activate_row(3)
+        st.add_scores("第一题18分 第二题12分 第三题15分")
+        r = st.check_total("总分45")
+        self.assertIn("一致", r.message)
+        self.assertNotIn("已自动切到下一位", r.message)
+        self.assertEqual(st.current.name, "张三")
+        self.assertEqual(st.current.row, 3)
+
+    def test_auto_next_off_by_default(self):
+        """没开 auto_next 时核对完不切人，等老师自己念下一位。"""
+        self.state.select_student("李四")
+        self.state.add_scores("第一题18分 第二题12分 第三题15分")
+        r = self.state.check_total("总分45")
+        self.assertNotIn("已自动切到下一位", r.message)
+        self.assertEqual(self.state.current.name, "李四")
+
 
 class TestNamedHeaderState(unittest.TestCase):
     """表头是「程序题」这类名称时，念表头名就能定向填分。"""
@@ -961,6 +1063,741 @@ class TestRepeatAndAmbiguityInState(unittest.TestCase):
         self.assertEqual(st.current.name, "刘洋")
 
 
+class TestChoiceOutOfRange(unittest.TestCase):
+    """选人时说岔了不能放行——放行会被号码定位当成「名单第 N 位」。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "test.xlsx")
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["姓名", "第一题", "第二题", "总分"])
+        for name in ("吴敏", "孙丽", "张伟", "陈静"):
+            ws.append([name, "", "", ""])
+        wb.save(self.path)
+        cfg = dict(CFG)
+        cfg["auto_save_mode"] = "manual"
+        self.st = AppState(cfg=cfg)
+        self.st.load(load_sheet(self.path, cfg, backup=False))
+        # 「午门儿」谁都不像但发音接近，走「没太听清」那条非模态候选路
+        self.st.handle_text("午门儿")
+        self.assertTrue(self.st._pending_choices)
+        self.n = len(self.st._pending_choices)
+        # 越界的说法：比候选数多一个。候选数随名单变，不写死
+        self.over = f"第{'一二三四五六'[self.n]}个"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_out_of_range_choice_does_not_jump_elsewhere(self):
+        """候选只有 N 个却说「第 N+1 个」，绝不能跳到名单第 N+1 位。"""
+        r = self.st.handle_text(self.over)
+        self.assertFalse(r.ok)
+        self.assertIsNone(self.st.current)
+
+    def test_out_of_range_choice_keeps_the_candidates(self):
+        """候选留着，老师再说一次就能定，不用重念名字。"""
+        self.st.handle_text(self.over)
+        self.assertTrue(self.st._pending_choices)
+        r = self.st.handle_text("第一个")
+        self.assertTrue(r.ok)
+        self.assertIsNotNone(self.st.current)
+
+    def test_out_of_range_message_lists_the_candidates(self):
+        r = self.st.handle_text(self.over)
+        self.assertIn(f"只有 {self.n} 个候选", r.message)
+        self.assertTrue(r.select_choices)
+
+    def test_a_valid_choice_still_works(self):
+        want = self.st._pending_choices[0][1]
+        r = self.st.handle_text("第一个")
+        self.assertTrue(r.ok)
+        self.assertEqual(self.st.current.name, want)
+
+
+class TestStudentOrdinal(unittest.TestCase):
+    """名单序号：念「第几个」与界面显示必须是同一个数。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "test.xlsx")
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["姓名", "第一题", "总分"])
+        for name in ("王小明", "李四", "张伟"):
+            ws.append([name, "", ""])
+        wb.save(self.path)
+        cfg = dict(CFG)
+        cfg["auto_save_mode"] = "manual"
+        self.st = AppState(cfg=cfg)
+        self.st.load(load_sheet(self.path, cfg, backup=False))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_ordinal_counts_students_not_excel_rows(self):
+        """第一位学生在 Excel 第 2 行，序号必须是 1。"""
+        first = self.st.model.students[0]
+        self.assertEqual(first.row, 1)          # 0 基，即 Excel 第 2 行
+        self.assertEqual(self.st.student_no(first), 1)
+        self.assertEqual(self.st.student_no(self.st.model.students[2]), 3)
+
+    def test_spoken_ordinal_selects_that_student(self):
+        self.st.handle_text("第三个")
+        self.assertEqual(self.st.current.name, "张伟")
+        self.assertEqual(self.st.student_no(self.st.current), 3)
+
+    def test_message_reports_both_row_and_ordinal(self):
+        """行号给人对 Excel，序号给人对「念第几个」。"""
+        r = self.st.handle_text("第三个")
+        self.assertIn("第3个", r.message)
+        self.assertIn(f"第{self.st.current.row + 1}行", r.message)
+
+
+class TestSaveOnlyWhenChecked(unittest.TestCase):
+    """checked 模式：只把核对对得上的结果同步进 Excel。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "test.xlsx")
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["姓名", "第一题", "第二题", "总分"])
+        ws.append(["李四", "", "", ""])
+        wb.save(self.path)
+        cfg = dict(CFG)
+        cfg["auto_save_mode"] = "checked"
+        self.st = AppState(cfg=cfg)
+        self.st.load(load_sheet(self.path, cfg, backup=False))
+        self.st.select_student("李四")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _saved(self):
+        from openpyxl import load_workbook as lw
+        ws = lw(self.path).active
+        return [ws.cell(row=2, column=c).value for c in (2, 3)]
+
+    def test_is_the_default_mode(self):
+        from grade_app.config import DEFAULT_CONFIG
+        self.assertEqual(AppState(cfg=dict(DEFAULT_CONFIG)).auto_save_mode(),
+                         "checked")
+
+    def test_filling_scores_does_not_write_yet(self):
+        self.st.add_scores("第一题18分 第二题12分")
+        self.assertEqual(self._saved(), [None, None])
+
+    def test_a_passing_check_writes(self):
+        self.st.add_scores("第一题18分 第二题12分")
+        self.st.check_total("总分30")
+        self.assertEqual(self._saved(), [18, 12])
+
+    def test_a_failing_check_does_not_write(self):
+        """念错了先别同步，让老师改完再说。"""
+        self.st.add_scores("第一题18分 第二题12分")
+        self.st.check_total("总分28")
+        self.assertEqual(self._saved(), [None, None])
+
+    def test_score_mode_still_writes_on_every_score(self):
+        """老模式不受影响。"""
+        self.st.cfg["auto_save_mode"] = "score"
+        self.st.add_scores("第一题18分")
+        self.assertEqual(self._saved(), [18, None])
+
+    def test_student_mode_still_writes_on_a_failing_check(self):
+        """student 模式下核对不一致照旧写盘，只有 checked 模式才拦。"""
+        self.st.cfg["auto_save_mode"] = "student"
+        self.st.add_scores("第一题18分 第二题12分")
+        self.st.check_total("总分28")
+        self.assertEqual(self._saved(), [18, 12])
+
+
+class TestAutosaveFailureIsVisible(unittest.TestCase):
+    """自动保存写不进去（Excel 占着文件）必须留下痕迹，不能静默丢分。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "test.xlsx")
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["姓名", "第一题", "第二题", "总分"])
+        ws.append(["李四", "", "", ""])
+        wb.save(self.path)
+        cfg = dict(CFG)
+        cfg["auto_save_mode"] = "score"
+        self.st = AppState(cfg=cfg)
+        self.st.load(load_sheet(self.path, cfg, backup=False))
+        self.st.select_student("李四")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_no_error_when_saving_works(self):
+        self.st.add_scores("第一题18分")
+        self.assertIsNone(self.st.save_error)
+
+    def test_locked_file_records_a_readable_reason(self):
+        with mock.patch("grade_app.excel_io.save_sheet",
+                        side_effect=PermissionError(13, "被占用")):
+            self.st.add_scores("第一题18分")
+        self.assertIsNotNone(self.st.save_error)
+        self.assertIn("Excel", self.st.save_error)
+
+    def test_scores_stay_in_memory_after_a_failed_save(self):
+        """写不进去也不能把已填的分数丢掉。"""
+        with mock.patch("grade_app.excel_io.save_sheet",
+                        side_effect=PermissionError(13, "被占用")):
+            self.st.add_scores("第一题18分")
+        self.assertEqual(self.st.model.students[0].scores, {1: 18.0})
+
+    def test_error_clears_once_saving_works_again(self):
+        with mock.patch("grade_app.excel_io.save_sheet",
+                        side_effect=PermissionError(13, "被占用")):
+            self.st.add_scores("第一题18分")
+        self.st.add_scores("第二题12分")
+        self.assertIsNone(self.st.save_error)
+
+    def test_other_errors_are_recorded_too(self):
+        with mock.patch("grade_app.excel_io.save_sheet",
+                        side_effect=OSError("磁盘满了")):
+            self.st.add_scores("第一题18分")
+        self.assertIn("磁盘满了", self.st.save_error)
+
+
+class TestSwitchingSheets(unittest.TestCase):
+    """换表比换学生更彻底，逐项残留都会让新表出现莫名其妙的行为。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make(self, tag, names, qs):
+        path = os.path.join(self.tmp, f"{tag}.xlsx")
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["姓名"] + [f"第{i}题" for i in range(1, qs + 1)] + ["总分"])
+        for n in names:
+            ws.append([n] + [None] * (qs + 1))
+        wb.save(path)
+        return path
+
+    def _state_on_first_sheet(self):
+        cfg = dict(CFG, auto_save_mode="manual")
+        st = AppState(cfg=cfg)
+        st.load(load_sheet(self._make("a", ("张三", "李四"), 2), cfg,
+                           backup=False))
+        return st
+
+    def _switch(self, st):
+        st.load(load_sheet(self._make("b", ("王五", "赵六"), 3), st.cfg,
+                           backup=False))
+
+    def test_pending_question_does_not_cross_sheets(self):
+        """在 A 表念了「第一题」还没念分数就换表，这个题号不能带过去。
+
+        带过去的话，新表里念的第一个分数会被填到第一题，而老师以为是
+        按顺序填下一个空题。
+        """
+        st = self._state_on_first_sheet()
+        st.handle_text("张三")
+        st.handle_text("第一题")
+        self.assertIsNotNone(st._pending_q)
+        self._switch(st)
+        self.assertIsNone(st._pending_q)
+
+    def test_last_edited_cell_does_not_cross_sheets(self):
+        """旧的编辑列会在新表上亮起一个从没填过的格子。"""
+        st = self._state_on_first_sheet()
+        st.handle_text("张三")
+        st.handle_text("第一题10分")
+        self.assertIsNotNone(st._last_edit_col)
+        self._switch(st)
+        self.assertIsNone(st._last_edit_col)
+
+    def test_held_line_does_not_cross_sheets(self):
+        """待补整句指的是旧表里的学生，换表必须作废。"""
+        st = self._state_on_first_sheet()
+        st._pending_line = "张三第一题10分总分10"
+        self._switch(st)
+        self.assertIsNone(st._pending_line)
+
+    def test_candidates_and_undo_do_not_cross_sheets(self):
+        st = self._state_on_first_sheet()
+        st.handle_text("张三")
+        st.handle_text("第一题10分")
+        st._pending_choices = [(1, "张三")]
+        self._switch(st)
+        self.assertIsNone(st._pending_choices)
+        self.assertEqual(st.undo_stack, [])
+        self.assertIsNone(st.current)
+        self.assertEqual(st.phase, "idle")
+
+    def test_save_error_does_not_cross_sheets(self):
+        """上一份表写不进去的原因，不该挂在新表上报警。"""
+        st = self._state_on_first_sheet()
+        st.save_error = "自动保存失败：表格正被 Excel 占用"
+        self._switch(st)
+        self.assertIsNone(st.save_error)
+
+    def test_old_roster_is_gone_after_switching(self):
+        st = self._state_on_first_sheet()
+        st.handle_text("张三")
+        self._switch(st)
+        r = st.handle_text("张三")
+        self.assertFalse(r.ok)
+        self.assertIsNone(st.current)
+
+    def test_switching_students_keeps_the_held_line(self):
+        """待补整句是跨激活传递的，切学生时不能被当成临时状态清掉。"""
+        st = self._state_on_first_sheet()
+        st._pending_line = "李四第一题10分总分10"
+        st._activate("张三", st.model.students[0].row, exact=True)
+        self.assertIsNotNone(st._pending_line)
+
+
+class TestUndoStack(unittest.TestCase):
+    """撤销栈的极端：空栈、深栈、跨学生、整批清空。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "t.xlsx")
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["姓名", "第一题", "第二题", "第三题", "总分"])
+        for n in ("张三", "李四", "王五"):
+            ws.append([n, None, None, None, None])
+        wb.save(self.path)
+        cfg = dict(CFG, auto_save_mode="manual")
+        self.st = AppState(cfg=cfg)
+        self.st.load(load_sheet(self.path, cfg, backup=False))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_undo_on_an_empty_stack_is_harmless(self):
+        for _ in range(50):
+            r = self.st.undo()
+            self.assertFalse(r.ok)
+
+    def test_deep_stack_unwinds_completely(self):
+        self.st.handle_text("张三")
+        for i in range(300):
+            self.st.handle_text(f"第一题{i % 100}分")
+        depth = len(self.st.undo_stack)
+        for _ in range(depth + 20):
+            self.st.undo()
+        self.assertEqual(self.st.model.students[0].scores, {})
+        self.assertEqual(self.st.undo_stack, [])
+
+    def test_undo_only_touches_the_last_change(self):
+        self.st.handle_text("张三")
+        self.st.handle_text("第一题10分")
+        self.st.handle_text("李四")
+        self.st.handle_text("第一题20分")
+        self.st.undo()
+        self.assertEqual(self.st.model.students[0].scores, {1: 10.0})
+        self.assertEqual(self.st.model.students[1].scores, {})
+
+    def test_undo_voids_the_check_result(self):
+        self.st.handle_text("张三")
+        self.st.handle_text("第一题10分第二题20分第三题30分")
+        self.st.handle_text("总分60")
+        self.assertIs(self.st.model.students[0].checked, True)
+        self.st.undo()
+        self.assertIsNone(self.st.model.students[0].checked)
+
+    def test_clearing_everything_is_one_undo(self):
+        for n in ("张三", "李四", "王五"):
+            self.st.handle_text(n)
+            self.st.handle_text("第一题1分第二题2分第三题3分")
+        before = [dict(s.scores) for s in self.st.model.students]
+        self.st.clear_cells([(s, c) for s in self.st.model.students
+                             for c in self.st.model.score_cols])
+        self.st.undo()
+        self.assertEqual([dict(s.scores) for s in self.st.model.students],
+                         before)
+
+
+class TestMessySheets(unittest.TestCase):
+    """老师的真实表格常常不规整，结构识别不能想当然。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "test.xlsx")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _sheet(self, rows):
+        wb = Workbook()
+        ws = wb.active
+        for r in rows:
+            ws.append(r)
+        wb.save(self.path)
+        return load_sheet(self.path, dict(CFG), backup=False)
+
+    def test_header_below_a_title_row(self):
+        """表格上方有标题行时，别把标题当表头、把真表头当学生。"""
+        m = self._sheet([["三年级期中成绩"], [],
+                         ["姓名", "第一题", "第二题", "总分"],
+                         ["张三", None, None, None],
+                         ["李四", None, None, None]])
+        self.assertEqual(m.header_row, 3)
+        self.assertEqual(m.header[:4], ["姓名", "第一题", "第二题", "总分"])
+        self.assertEqual([s.name for s in m.students], ["张三", "李四"])
+        self.assertEqual(m.score_cols, [1, 2])
+
+    def test_title_row_survives_a_save(self):
+        """写回时不能把标题行覆盖掉，行号也要对得上。"""
+        from openpyxl import load_workbook as lw
+        m = self._sheet([["三年级期中成绩"], [],
+                         ["姓名", "第一题", "总分"],
+                         ["张三", None, None]])
+        st = AppState(cfg=dict(CFG, auto_save_mode="manual"))
+        st.load(m)
+        st.handle_text("张三")
+        st.handle_text("第一题18分")
+        save_sheet(m, st.cfg, write_formula=True)
+        ws = lw(self.path).active
+        self.assertEqual(ws.cell(row=1, column=1).value, "三年级期中成绩")
+        self.assertEqual(ws.cell(row=3, column=1).value, "姓名")
+        self.assertEqual(ws.cell(row=4, column=2).value, 18)
+
+    def test_total_column_in_the_middle(self):
+        """总分不在最右边时，题目列全在它右边，也得认出来。"""
+        m = self._sheet([["姓名", "总分", "第一题", "第二题"],
+                         ["张三", None, None, None]])
+        self.assertEqual(m.score_cols, [2, 3])
+        self.assertEqual(m.score_count, 2)
+
+    def test_can_actually_score_with_total_in_the_middle(self):
+        m = self._sheet([["姓名", "总分", "第一题", "第二题"],
+                         ["张三", None, None, None]])
+        st = AppState(cfg=dict(CFG, auto_save_mode="manual"))
+        st.load(m)
+        st.handle_text("张三")
+        st.handle_text("第一题10分第二题20分")
+        self.assertEqual(m.students[0].scores, {2: 10.0, 3: 20.0})
+        self.assertEqual(m.calc_total(m.students[0]), 30.0)
+
+    def test_plain_sheet_still_uses_the_first_row(self):
+        """规整的表不受影响。"""
+        m = self._sheet([["姓名", "第一题", "总分"], ["张三", None, None]])
+        self.assertEqual(m.header_row, 1)
+        self.assertEqual([s.name for s in m.students], ["张三"])
+
+
+class TestAbsurdScores(unittest.TestCase):
+    """识别偶尔把一串数字连成天文数字，填进去会毁掉整张表。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "test.xlsx")
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["姓名", "第一题", "第二题", "总分"])
+        ws.append(["张三", "", "", ""])
+        wb.save(self.path)
+        cfg = dict(CFG, auto_save_mode="manual")
+        self.st = AppState(cfg=cfg)
+        self.st.load(load_sheet(self.path, cfg, backup=False))
+        self.st.handle_text("张三")
+        self.stu = self.st.model.students[0]
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_astronomical_value_is_refused(self):
+        r = self.st.add_scores("第一题99999999999999999999分")
+        self.assertEqual(self.stu.scores, {})
+        self.assertIn("不像分数", r.message)
+
+    def test_the_limit_itself_is_accepted(self):
+        from grade_app.state import MAX_SCORE
+        self.st.add_scores(f"第一题{MAX_SCORE:.0f}分")
+        self.assertEqual(self.stu.scores, {1: MAX_SCORE})
+
+    def test_just_over_the_limit_is_refused(self):
+        from grade_app.state import MAX_SCORE
+        self.st.add_scores(f"第一题{MAX_SCORE + 1:.0f}分")
+        self.assertEqual(self.stu.scores, {})
+
+    def test_a_good_score_in_the_same_breath_still_lands(self):
+        """一句里一个正常一个荒谬，正常那个不能被牵连。"""
+        self.st.add_scores("第一题10分第二题99999999分")
+        self.assertEqual(self.stu.scores, {1: 10.0})
+
+    def test_normal_scores_are_untouched(self):
+        self.st.add_scores("第一题100分第二题0分")
+        self.assertEqual(self.stu.scores, {1: 100.0, 2: 0.0})
+
+
+class TestExcelCentring(unittest.TestCase):
+    """写回 Excel 时表头与各学生行居中，跟软件里看到的一致。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "test.xlsx")
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["姓名", "第一题", "第二题", "总分"])
+        ws.append(["张三", "", "", ""])
+        wb.save(self.path)
+        self.cfg = dict(CFG)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _saved(self):
+        from openpyxl import load_workbook as lw
+        return lw(self.path).active
+
+    def _fill_and_save(self):
+        m = load_sheet(self.path, self.cfg, backup=False)
+        m.students[0].scores = {1: 10.0, 2: 20.0}
+        m.students[0].total = 30.0
+        save_sheet(m, self.cfg, write_formula=True)
+        return m
+
+    def test_header_row_is_centred(self):
+        m = self._fill_and_save()
+        ws = self._saved()
+        for col in range(m.check_col + 1):
+            self.assertEqual(ws.cell(row=1, column=col + 1).alignment.horizontal,
+                             "center")
+
+    def test_student_rows_are_centred(self):
+        m = self._fill_and_save()
+        ws = self._saved()
+        for col in range(m.check_col + 1):
+            cell = ws.cell(row=2, column=col + 1)
+            self.assertEqual(cell.alignment.horizontal, "center")
+            self.assertEqual(cell.alignment.vertical, "center")
+
+    def test_centring_keeps_the_mismatch_colours(self):
+        """居中不能把不一致那格的红底红字冲掉。"""
+        m = load_sheet(self.path, self.cfg, backup=False)
+        stu = m.students[0]
+        stu.scores = {1: 10.0, 2: 20.0}
+        stu.total = 30.0
+        stu.checked = False
+        stu.spoken_total = 28.0
+        save_sheet(m, self.cfg, write_formula=True)
+        cell = self._saved().cell(row=2, column=m.check_col + 1)
+        self.assertEqual(cell.alignment.horizontal, "center")
+        self.assertEqual(cell.value, "不一致（报28 算30）")
+        self.assertEqual(cell.fill.start_color.rgb, "FFFFC7CE")
+
+    def test_centring_keeps_wrap_text(self):
+        """只改水平/垂直对齐，老师设过的换行不能被抹掉。"""
+        from openpyxl import load_workbook as lw
+        from openpyxl.styles import Alignment
+        wb = lw(self.path)
+        wb.active.cell(row=2, column=1).alignment = Alignment(wrap_text=True)
+        wb.save(self.path)
+        self._fill_and_save()
+        self.assertTrue(self._saved().cell(row=2, column=1).alignment.wrap_text)
+
+    def test_check_column_widens_for_the_mismatch_text(self):
+        """「不一致（报28 算30）」按默认列宽会显示成 ####。"""
+        from openpyxl.utils import get_column_letter
+        m = load_sheet(self.path, self.cfg, backup=False)
+        stu = m.students[0]
+        stu.scores = {1: 10.0, 2: 20.0}
+        stu.total = 30.0
+        stu.checked = True
+        save_sheet(m, self.cfg, write_formula=True)
+        letter = get_column_letter(m.check_col + 1)
+        with_tick = self._saved().column_dimensions[letter].width
+        stu.checked = False
+        stu.spoken_total = 28.0
+        save_sheet(m, self.cfg, write_formula=True)
+        with_text = self._saved().column_dimensions[letter].width
+        self.assertGreater(with_text, with_tick)
+        # 「不一致（报28 算30）」按半角计 20 格，再留 2 格余量
+        self.assertGreaterEqual(with_text, 20)
+
+    def test_a_wider_check_column_is_left_alone(self):
+        """老师自己拉宽过就别动他的。"""
+        from openpyxl import load_workbook as lw
+        from openpyxl.utils import get_column_letter
+        m = load_sheet(self.path, self.cfg, backup=False)
+        letter = get_column_letter(m.check_col + 1)
+        wb = lw(self.path)
+        wb.active.column_dimensions[letter].width = 40
+        wb.save(self.path)
+        self._fill_and_save()
+        self.assertEqual(self._saved().column_dimensions[letter].width, 40)
+
+
+class TestWholeLineForAnotherStudent(unittest.TestCase):
+    """一句话念完另一位学生的「名字＋各题＋总分」，不能牵连上一位。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "test.xlsx")
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["姓名", "第一题", "第二题", "总分"])
+        for name in ("张三", "孙丽", "郑浩", "张三"):   # 张三重名两行
+            ws.append([name, "", "", ""])
+        wb.save(self.path)
+        cfg = dict(CFG)
+        cfg["auto_save_mode"] = "manual"
+        self.st = AppState(cfg=cfg)
+        self.st.load(load_sheet(self.path, cfg, backup=False))
+        self.zheng = self._stu("郑浩")[0]
+        # 郑浩先录完并核对通过
+        self.st.activate_row(self.zheng.row)
+        self.st.handle_text("第一题十分第二题十分总分二十分")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _stu(self, name):
+        return [s for s in self.st.model.students if s.name == name]
+
+    def test_setup_left_the_previous_student_checked(self):
+        self.assertIs(self.zheng.checked, True)
+
+    def test_another_students_line_does_not_touch_the_current_one(self):
+        """核心：念孙丽那句的总分，绝不能拿去核对还停在当前的郑浩。"""
+        self.st.handle_text("孙丽第一题七十分第二题六十分总分一百三十分")
+        self.assertIs(self.zheng.checked, True)
+        self.assertIsNone(self.zheng.spoken_total)
+
+    def test_another_students_line_lands_on_that_student(self):
+        self.st.handle_text("孙丽第一题七十分第二题六十分总分一百三十分")
+        sun = self._stu("孙丽")[0]
+        self.assertEqual(sun.scores, {1: 70.0, 2: 60.0})
+        self.assertIs(sun.checked, True)
+        self.assertEqual(self.st.current.name, "孙丽")
+
+    def test_duplicate_name_asks_first_and_spares_the_previous_student(self):
+        """同名两位要弹窗；在选定之前，上一位的核对结论不许动。"""
+        r = self.st.handle_text("张三第一题十分第二题二十分总分三十分")
+        self.assertTrue(r.select_choices)
+        self.assertEqual({n for _row, n in r.select_choices}, {"张三"})
+        self.assertIs(self.zheng.checked, True)
+        for stu in self._stu("张三"):
+            self.assertEqual(stu.scores, {})
+
+    def test_picking_the_duplicate_applies_the_held_line(self):
+        """选完人，这一句的分数与总分要补到选中的那位身上。"""
+        self.st.handle_text("张三第一题十分第二题二十分总分三十分")
+        first, second = self._stu("张三")
+        self.st.activate_row(first.row)
+        self.assertEqual(first.scores, {1: 10.0, 2: 20.0})
+        self.assertIs(first.checked, True)
+        self.assertEqual(second.scores, {})      # 另一位张三不受影响
+
+    def test_a_wrong_total_still_lands_on_the_right_student(self):
+        """总分念错时，标红的必须是这一句点到的人。"""
+        self.st.handle_text("孙丽第一题七十分第二题六十分总分一百分")
+        sun = self._stu("孙丽")[0]
+        self.assertIs(sun.checked, False)
+        self.assertEqual(sun.spoken_total, 100.0)
+        self.assertIs(self.zheng.checked, True)
+
+    def test_held_line_expires_when_the_teacher_says_something_else(self):
+        """没选人就改口，暂存作废；之后随手点一行不该被灌上旧分数。"""
+        self.st.handle_text("张三第一题十分第二题二十分总分三十分")
+        self.st.handle_text("孙丽")
+        first = self._stu("张三")[0]
+        self.st.activate_row(first.row)
+        self.assertEqual(first.scores, {})
+
+    def test_own_name_repeated_still_fills_and_checks(self):
+        """念的是当前学生自己的名字，照旧走「填分＋核对」，没被拦掉。"""
+        sun = self._stu("孙丽")[0]
+        self.st.activate_row(sun.row)
+        self.st.handle_text("孙丽第一题七十分第二题六十分总分一百三十分")
+        self.assertEqual(sun.scores, {1: 70.0, 2: 60.0})
+        self.assertIs(sun.checked, True)
+
+
+class TestTotalCheckFeedback(unittest.TestCase):
+    """核对总分的反馈：一致与不一致要能分辨，差多少要写出来。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "test.xlsx")
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["姓名", "第一题", "第二题", "总分"])
+        ws.append(["李四", "", "", ""])
+        wb.save(self.path)
+        cfg = dict(CFG)
+        cfg["auto_save_mode"] = "manual"
+        self.st = AppState(cfg=cfg)
+        self.st.load(load_sheet(self.path, cfg, backup=False))
+        self.st.select_student("李四")
+        self.st.add_scores("第一题18分 第二题12分")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_matching_total_asks_for_the_success_sound(self):
+        r = self.st.check_total("总分30")
+        self.assertEqual(r.sound, "success")
+        self.assertTrue(r.ok)
+
+    def test_mismatching_total_asks_for_the_error_sound(self):
+        """念错要响报错音，不能跟填对一个分数一个声。"""
+        r = self.st.check_total("总分28")
+        self.assertEqual(r.sound, "error")
+        self.assertFalse(r.ok)
+
+    def test_mismatch_reports_the_gap(self):
+        r = self.st.check_total("总分28")
+        self.assertIn("28", r.message)
+        self.assertIn("30", r.message)
+        self.assertIn("-2", r.message)      # 差值直接写出来
+
+    def test_mismatch_keeps_what_the_teacher_said(self):
+        """核对列要连老师报的数一起写，只写「不一致」看不出差在哪。"""
+        self.st.check_total("总分28")
+        stu = self.st.model.students[0]
+        self.assertEqual(stu.spoken_total, 28.0)
+        self.assertEqual(check_mark_text(stu), "不一致（报28 算30）")
+
+    def test_matching_total_clears_any_earlier_spoken_value(self):
+        self.st.check_total("总分28")
+        self.st.check_total("总分30")
+        self.assertIsNone(self.st.model.students[0].spoken_total)
+
+    def test_changing_a_score_voids_the_spoken_value(self):
+        """分数一改，上一轮报的总分就不该再挂在核对列上。"""
+        self.st.check_total("总分28")
+        self.st.add_scores("第一题20分")
+        self.assertIsNone(self.st.model.students[0].spoken_total)
+        self.assertIsNone(self.st.model.students[0].checked)
+
+    def test_undo_voids_the_spoken_value(self):
+        self.st.check_total("总分28")
+        self.st.undo()
+        self.assertIsNone(self.st.model.students[0].spoken_total)
+
+    def test_spoken_value_survives_a_reopen(self):
+        """存盘关掉再打开，仍然看得见当时报的是多少。"""
+        self.st.check_total("总分28")
+        save_sheet(self.st.model, self.st.cfg, write_formula=True)
+        again = load_sheet(self.path, self.st.cfg, backup=False)
+        stu = again.students[0]
+        self.assertIs(stu.checked, False)
+        self.assertEqual(stu.spoken_total, 28.0)
+        self.assertEqual(check_mark_text(stu), "不一致（报28 算30）")
+
+    def test_total_column_survives_a_reopen_with_formulas(self):
+        """总分列存的是 =SUM()，读回来是公式字符串，得自己算一遍。"""
+        save_sheet(self.st.model, self.st.cfg, write_formula=True)
+        again = load_sheet(self.path, self.st.cfg, backup=False)
+        self.assertEqual(again.students[0].total, 30.0)
+
+
 class TestAutoSaveMode(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -1005,6 +1842,12 @@ class TestAutoSaveMode(unittest.TestCase):
         st.add_scores("第一题18分 第二题12分")
         st.check_total("总分30")
         self.assertEqual(self._saved_scores(), [None, None])
+
+    def test_trailing_question_head_still_saves_the_score(self):
+        """「第一题18分第二题」句尾只有题号：前面那个分数照样要落盘。"""
+        st = self._state(auto_save_mode="score")
+        st.add_scores("第一题18分第二题")
+        self.assertEqual(self._saved_scores(), [18, None])
 
     def test_legacy_auto_save_flag_maps_to_manual(self):
         st = self._state(auto_save=False, auto_save_mode=None)
@@ -1289,3 +2132,29 @@ class TestNoOpRewriteIsNotAFix(unittest.TestCase):
         r = self.state.handle_text("第一题九分")
         self.assertEqual(self.state.current.scores.get(1), 9.0)
         self.assertIn("修正", r.message)
+
+
+class TestNextStudentCmd(unittest.TestCase):
+    """「下一个/继续」指令识别：指令词与同音姓名不能互相吞掉。"""
+
+    def test_all_command_phrasings(self):
+        for cmd in ("下一个", "下一位", "下个", "继续", "接着来", "下一名"):
+            self.assertTrue(parser.is_next_student_cmd(cmd), cmd)
+
+    def test_normal_speech_is_not_a_command(self):
+        for text in ("张三", "十八分", "今天天气不错", "第一题十二分"):
+            self.assertFalse(parser.is_next_student_cmd(text), text)
+
+    def test_punctuation_stripped(self):
+        self.assertTrue(parser.is_next_student_cmd("下一个。"))
+
+    def test_homophone_name_shields_command(self):
+        """「继续」和「纪旭」同音：名单里有纪旭时按姓名处理，不吞点名。"""
+        self.assertFalse(parser.is_next_student_cmd("继续", ["纪旭"]))
+
+    def test_unrelated_names_do_not_shield(self):
+        self.assertTrue(parser.is_next_student_cmd("继续", ["李四", "王五"]))
+
+    def test_short_name_never_shields(self):
+        """单字名（如「旭」）发音重合面太宽，不能拿来挡指令。"""
+        self.assertTrue(parser.is_next_student_cmd("继续", ["旭"]))
