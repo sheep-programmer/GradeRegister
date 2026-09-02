@@ -3,8 +3,9 @@
 
     pyinstaller GradeRegister.spec --noconfirm
 
-语音模型（sense-voice，约 228MB）随程序打包，装好即用不联网。
-vosk / faster-whisper / sherpa 流式模型都不打进去：用不到，且体积是它的数倍。
+语音模型（sense-voice 约 228MB + paraformer 约 217MB）随程序打包，
+装好即用不联网。vosk / faster-whisper / sherpa 流式模型都不打进去：
+用不到，且体积是它的数倍。
 """
 import os
 import sys
@@ -16,16 +17,22 @@ IS_MAC = sys.platform == "darwin"
 
 # ---------------------------------------------------------------- 随包资源
 MODEL_FILES = ("model.int8.onnx", "tokens.txt")
-model_src = os.path.join(PROJECT, "models", "sense-voice")
-missing = [f for f in MODEL_FILES
-           if not os.path.isfile(os.path.join(model_src, f))]
+
+# 内置两个整句解码引擎：sense-voice（默认）与 paraformer（短句更快）
+# 目录名与 grade_app/speech.py 的 paraformer_dir() 保持一致
+bundled_models = ("sense-voice", "paraformer-zh")
+missing = []
+datas = []
+for sub in bundled_models:
+    model_src = os.path.join(PROJECT, "models", sub)
+    missing += [os.path.join(sub, f) for f in MODEL_FILES
+                if not os.path.isfile(os.path.join(model_src, f))]
+    datas += [(os.path.join(model_src, f), os.path.join("models", sub))
+              for f in MODEL_FILES]
 if missing:
     raise SystemExit(
         f"语音模型缺失: {missing}\n"
-        f"请先运行 python download_model.py 把模型下到 {model_src}")
-
-datas = [(os.path.join(model_src, f), "models/sense-voice")
-         for f in MODEL_FILES]
+        f"请先运行 python download_model.py 把模型下到 models/ 下")
 
 # ---------------------------------------------------------------- 原生依赖
 # sherpa-onnx 与 onnxruntime 的动态库不会被自动收全，显式收集
@@ -41,6 +48,9 @@ hiddenimports = (
     + collect_submodules("tksheet")
     + ["sounddevice", "_sounddevice", "cffi", "openpyxl", "pypinyin"]
 )
+if sys.platform == "win32":
+    # 请 Excel 交出被占用的表格要走 COM
+    hiddenimports += ["win32com.client", "pythoncom", "pywintypes"]
 
 # 体积大头，全都用不上：识别只走内置的 sense-voice
 excludes = [

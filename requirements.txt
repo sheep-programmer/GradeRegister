@@ -3,6 +3,8 @@ sounddevice>=0.4.6
 sherpa-onnx>=1.10
 numpy>=1.24
 pypinyin>=0.50
+# Windows 上用来请 Excel 关掉正被占用的那份表格；缺了只会退回提示老师手动关
+pywin32>=306; sys_platform == "win32"
 tksheet>=7.6
 vosk>=0.3.44
 # 可选备用引擎（模型较大、加载慢）

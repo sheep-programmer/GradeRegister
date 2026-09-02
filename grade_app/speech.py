@@ -131,6 +131,8 @@ class VoskEngine:
 
     def feed(self, pcm: bytes) -> str:
         with self._lock:
+            if self._kaldi is None:
+                return ""
             if self._kaldi.AcceptWaveform(pcm):
                 self._kaldi.Result()  # 丢弃已消化结果，partial 会即时反映
             return self.partial()
@@ -235,7 +237,12 @@ def _cn_num(n: int) -> str:
         return s
     if rest < 10:
         return s + "零" + _CN_DIGITS[rest]
-    return s + _cn_num(rest)
+    # 百位后面的十位要带「一」：110 读作「一百一十」而不是「一百十」。
+    # 直接递归会得到后者，而它不是标准读法——错的写法进了识别词表会让
+    # 识别器偏向产出它，解析时那个「十」被吞掉，110 变成 100
+    tens, ones = divmod(rest, 10)
+    out = s + _CN_DIGITS[tens] + "十"
+    return out + _CN_DIGITS[ones] if ones else out
 
 
 def build_grade_vocab(names, headers=()) -> List[str]:
@@ -280,42 +287,89 @@ def sherpa_model_dir(cfg: dict) -> str:
         "模型目录 models/sherpa 缺失或损坏")
 
 
+def hotwords_path(cfg: dict) -> str:
+    """热词文件位置：模型目录在打包版里是只读的，热词写用户数据目录。"""
+    return os.path.join(paths.user_data_dir(), "hotwords.txt")
+
+
 class SherpaEngine:
-    """sherpa-onnx 流式 Zipformer（中英双语）：毫秒级加载、真流式 partial。"""
+    """sherpa-onnx 流式 Zipformer（中英双语）：毫秒级加载、真流式 partial。
+
+    支持热词（hotwords）：把学生名单写进热词文件，解码时给这些词加分，
+    念姓名不再被听成无关的日常词。名单在打开表格后才确定，所以热词在
+    下一次录音开始时重建识别器生效（重建约几百毫秒，发生在录音之前）。
+    """
 
     def __init__(self, cfg: dict, sample_rate: int = 16000):
-        import sherpa_onnx
-        d = sherpa_model_dir(cfg)
-        pick = lambda name: os.path.join(  # noqa: E731
-            d, name) if os.path.exists(os.path.join(d, name)) else os.path.join(
-            d, name.replace(".onnx", ".int8.onnx"))
-        self._rec = sherpa_onnx.OnlineRecognizer.from_transducer(
-            tokens=os.path.join(d, "tokens.txt"),
-            encoder=pick("encoder-epoch-99-avg-1.onnx"),
-            decoder=pick("decoder-epoch-99-avg-1.onnx"),
-            joiner=pick("joiner-epoch-99-avg-1.onnx"),
-            num_threads=2, sample_rate=sample_rate, feature_dim=80,
-            decoding_method="greedy_search",
-            # 实时对讲式端点检测：说完一句（尾部静音 1 秒）自动断句，
-            # reset 只重置解码状态、音频流无缝继续——不会丢字
-            enable_endpoint_detection=True,
-            rule1_min_trailing_silence=2.0,
-            rule2_min_trailing_silence=1.0,
-            rule3_min_utterance_length=20,
-        )
+        self.cfg = cfg
         self.sample_rate = sample_rate
+        self._model_dir = sherpa_model_dir(cfg)
+        self._hotwords_file = ""
+        self._hotwords_dirty = False
+        self._rec = self._create_recognizer("")
         self._stream = None
         self._finished = False
         self._lock = threading.RLock()
 
+    def _create_recognizer(self, hotwords_file: str):
+        import sherpa_onnx
+        d = self._model_dir
+        pick = lambda name: os.path.join(  # noqa: E731
+            d, name) if os.path.exists(os.path.join(d, name)) else os.path.join(
+            d, name.replace(".onnx", ".int8.onnx"))
+        # 热词要求 modified_beam_search 解码（sherpa_onnx 对 greedy_search
+        # + hotwords_file 直接抛错）；没热词时保持 greedy_search，更快
+        decoding_method = ("modified_beam_search" if hotwords_file
+                           else "greedy_search")
+        return sherpa_onnx.OnlineRecognizer.from_transducer(
+            tokens=os.path.join(d, "tokens.txt"),
+            encoder=pick("encoder-epoch-99-avg-1.onnx"),
+            decoder=pick("decoder-epoch-99-avg-1.onnx"),
+            joiner=pick("joiner-epoch-99-avg-1.onnx"),
+            num_threads=2, sample_rate=self.sample_rate, feature_dim=80,
+            decoding_method=decoding_method,
+            # 实时对讲式端点检测：说完一句（尾部静音）自动断句，
+            # reset 只重置解码状态、音频流无缝继续——不会丢字。
+            # 静音阈值不宜太长：老师说完要等近 2 秒才出结果，太煎熬
+            enable_endpoint_detection=True,
+            rule1_min_trailing_silence=1.2,
+            rule2_min_trailing_silence=0.6,
+            rule3_min_utterance_length=20,
+            # 热词加分：名单里的姓名/表头在解码时获得额外偏置
+            hotwords_file=hotwords_file,
+            hotwords_score=1.5,
+        )
+
     def begin(self) -> None:
         with self._lock:
+            if self._hotwords_dirty:
+                self._rec = self._create_recognizer(self._hotwords_file)
+                self._hotwords_dirty = False
             self._stream = self._rec.create_stream()
             self._finished = False
 
     def set_grammar(self, words) -> None:
-        """sherpa 暂不支持词表约束（拼音纠错已兜底人名），保留接口。"""
-        return None
+        """把学生名单与常用语写入热词文件，下一次录音开始时生效。
+
+        传 None/空 则清除热词（重建为无热词的识别器）。
+        """
+        with self._lock:
+            path = ""
+            if words:
+                cleaned = sorted({str(w).strip() for w in words
+                                  if str(w).strip()})
+                try:
+                    path = hotwords_path(self.cfg)
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(cleaned))
+                except OSError as e:
+                    print(f"[warn] 热词文件写入失败（退回无热词）: {e}",
+                          flush=True)
+                    path = ""
+            if path != self._hotwords_file:
+                self._hotwords_file = path
+                self._hotwords_dirty = True
 
     def feed(self, pcm: bytes) -> str:
         with self._lock:
@@ -376,33 +430,36 @@ SENSE_VOICE_FILES = (
     ("tokens.txt", _SENSE_VOICE_BASE + "tokens.txt", 316_000),
 )
 
-
-def sense_voice_dir(cfg: dict) -> str:
-    """模型目录，路径基于项目目录解析，从任意工作目录启动都找得到。"""
-    return os.path.join(model_dir_path(cfg), "sense-voice")
-
-
-def sense_voice_ready(cfg: dict) -> bool:
-    d = sense_voice_dir(cfg)
-    return all(os.path.isfile(os.path.join(d, name))
-               for name, _url, _size in SENSE_VOICE_FILES)
+# 2024-03-09 版 paraformer-large。短句场景实测比 sense-voice 略准且更快，
+# 对「姓名+分数」连读（如「李四十八分」）不丢字
+_PARA_BASE = ("https://huggingface.co/csukuangfj/"
+              "sherpa-onnx-paraformer-zh-2024-03-09/resolve/main/")
+PARAFORMER_FILES = (
+    ("model.int8.onnx", _PARA_BASE + "model.int8.onnx", 217_000_000),
+    ("tokens.txt", _PARA_BASE + "tokens.txt", 74_000),
+)
 
 
-def download_sense_voice(cfg: dict, progress=None) -> str:
-    """下载模型文件，已存在的跳过。progress(已下载字节, 总字节)。
+def _files_present(model_dir: str, files) -> bool:
+    return all(os.path.isfile(os.path.join(model_dir, name))
+               for name, _url, _size in files)
+
+
+def _download_files(model_dir: str, files, progress=None) -> str:
+    """下载一组模型文件，已存在的跳过。progress(已下载字节, 总字节)。
 
     进度按所有待下文件的总字节算，不是每个文件各走一遍 0~100%。
+    先写 .part 再改名：中断留下的残片不会被当成下好的模型。
     """
-    d = sense_voice_dir(cfg)
-    os.makedirs(d, exist_ok=True)
-    todo = [(n, u, s) for n, u, s in SENSE_VOICE_FILES
-            if not os.path.isfile(os.path.join(d, n))]
+    os.makedirs(model_dir, exist_ok=True)
+    todo = [(n, u, s) for n, u, s in files
+            if not os.path.isfile(os.path.join(model_dir, n))]
     if not todo:
-        return d
+        return model_dir
     total_all = sum(s for _n, _u, s in todo)
     done_before = 0
     for name, url, approx in todo:
-        dst = os.path.join(d, name)
+        dst = os.path.join(model_dir, name)
         tmp = dst + ".part"
         print(f"[voice] 正在下载识别模型 {name} …", flush=True)
 
@@ -422,32 +479,55 @@ def download_sense_voice(cfg: dict, progress=None) -> str:
         done_before += approx
     if progress:
         progress(total_all, total_all)
-    return d
+    return model_dir
 
 
-class SenseVoiceEngine:
-    """整句解码：录音期间不出中间结果，停顿断句后一次性识别。"""
+def paraformer_dir(cfg: dict) -> str:
+    """模型目录，路径基于项目目录解析，从任意工作目录启动都找得到。"""
+    return os.path.join(model_dir_path(cfg), "paraformer-zh")
+
+
+def paraformer_ready(cfg: dict) -> bool:
+    return _files_present(paraformer_dir(cfg), PARAFORMER_FILES)
+
+
+def download_paraformer(cfg: dict, progress=None) -> str:
+    return _download_files(paraformer_dir(cfg), PARAFORMER_FILES, progress)
+
+
+def sense_voice_dir(cfg: dict) -> str:
+    """模型目录，路径基于项目目录解析，从任意工作目录启动都找得到。"""
+    return os.path.join(model_dir_path(cfg), "sense-voice")
+
+
+def sense_voice_ready(cfg: dict) -> bool:
+    return _files_present(sense_voice_dir(cfg), SENSE_VOICE_FILES)
+
+
+def download_sense_voice(cfg: dict, progress=None) -> str:
+    return _download_files(sense_voice_dir(cfg), SENSE_VOICE_FILES, progress)
+
+
+def _offline_model_files(model_dir: str) -> tuple:
+    """整句解码模型的 (模型文件, 词表文件)，缺一个就报错。"""
+    model = os.path.join(model_dir, "model.int8.onnx")
+    tokens = os.path.join(model_dir, "tokens.txt")
+    if not (os.path.isfile(model) and os.path.isfile(tokens)):
+        raise FileNotFoundError(
+            f"未找到识别模型（{model_dir} 下缺 model.int8.onnx 或 tokens.txt）")
+    return model, tokens
+
+
+class _OfflineEngine:
+    """整句解码引擎的共用部分：录音期间只攒音频，停顿断句后一次性识别。"""
 
     streaming = False
 
-    def __init__(self, cfg: dict, sample_rate: int = 16000):
-        import sherpa_onnx
-        d = sense_voice_dir(cfg)
-        model = os.path.join(d, "model.int8.onnx")
-        tokens = os.path.join(d, "tokens.txt")
-        if not (os.path.isfile(model) and os.path.isfile(tokens)):
-            raise FileNotFoundError(f"未找到识别模型（{d} 下缺 model.int8.onnx 或 tokens.txt）")
-        self._rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-            model=model, tokens=tokens, num_threads=2,
-            # 锁定中文：这是个中英日韩粤多语种模型，不指定就自动判语种，
-            # 「八分」「加三分」这类半秒短音频经常被判成英文，吐出
-            # tin / baten / smerton 这种拼音式英文，整句作废
-            language="zh",
-            # 不做数字规范化：它会把「第三题九分」并成「第39分」，
-            # 中文数字交给解析器处理更稳
-            use_itn=False)
+    def __init__(self, recognizer, sample_rate: int = 16000):
+        self._rec = recognizer
         self.sample_rate = sample_rate
         self._frames: List[np.ndarray] = []
+        # 解码调用不是线程安全的，串行化保护
         self._lock = threading.RLock()
 
     def begin(self) -> None:
@@ -478,6 +558,33 @@ class SenseVoiceEngine:
         return _strip_tags(stream.result.text)
 
 
+class SenseVoiceEngine(_OfflineEngine):
+    """整句解码：录音期间不出中间结果，停顿断句后一次性识别。"""
+
+    def __init__(self, cfg: dict, sample_rate: int = 16000):
+        import sherpa_onnx
+        model, tokens = _offline_model_files(sense_voice_dir(cfg))
+        super().__init__(sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=model, tokens=tokens, num_threads=2,
+            # 锁定中文：这是个中英日韩粤多语种模型，不指定就自动判语种，
+            # 「八分」「加三分」这类半秒短音频经常被判成英文，吐出
+            # tin / baten / smerton 这种拼音式英文，整句作废
+            language="zh",
+            # 不做数字规范化：它会把「第三题九分」并成「第39分」，
+            # 中文数字交给解析器处理更稳
+            use_itn=False), sample_rate)
+
+
+class ParaformerEngine(_OfflineEngine):
+    """整句解码，与 sense-voice 同接口：录音期间不出中间结果，停顿后一次性识别。"""
+
+    def __init__(self, cfg: dict, sample_rate: int = 16000):
+        import sherpa_onnx
+        model, tokens = _offline_model_files(paraformer_dir(cfg))
+        super().__init__(sherpa_onnx.OfflineRecognizer.from_paraformer(
+            paraformer=model, tokens=tokens, num_threads=2), sample_rate)
+
+
 _TAG_RE = re.compile(r"<\|[^|]*\|>")
 _LATIN_RE = re.compile(r"[A-Za-z]+")
 _CJK_RE = re.compile(r"[一-鿿]")
@@ -492,17 +599,17 @@ def _strip_tags(text: str) -> str:
     return text.strip().strip("。，！？、 ")
 
 
-ALL_ENGINES = ("sense-voice", "sherpa", "vosk", "faster-whisper")
+ALL_ENGINES = ("sense-voice", "paraformer", "sherpa", "vosk", "faster-whisper")
 
 
 def available_engines(cfg: dict) -> List[str]:
     """当前这份程序里真正能用起来的引擎。
 
-    打包版只随程序带了 sense-voice：sherpa 的模型要跟着仓库分发、
-    faster-whisper 与 vosk 的依赖没打进去。把它们照旧列在设置里，
-    老师切过去只会撞上「找不到 tokens.txt」而且点下载也没反应。
+    打包版只随程序带了 sense-voice 与 paraformer：sherpa 的模型要跟着
+    仓库分发、faster-whisper 与 vosk 的依赖没打进去。把它们照旧列在
+    设置里，老师切过去只会撞上「找不到 tokens.txt」而且点下载也没反应。
     """
-    out = ["sense-voice"]          # 内置，缺了也能自动下载
+    out = ["sense-voice", "paraformer"]   # 内置，缺了也能自动下载
     try:
         sherpa_model_dir(cfg)
         out.append("sherpa")
@@ -513,6 +620,10 @@ def available_engines(cfg: dict) -> List[str]:
     if importlib.util.find_spec("faster_whisper") is not None:
         out.append("faster-whisper")
     return out
+
+
+# 自带端点检测的引擎：断句由引擎自己判，segment_gap 那档设置对它无效
+NATIVE_ENDPOINT_ENGINES = frozenset({"sherpa"})
 
 
 def resolve_engine(cfg: dict) -> str:
@@ -529,7 +640,7 @@ def resolve_engine(cfg: dict) -> str:
 def create_engine(cfg: dict):
     """按配置创建语音引擎；缺模型/依赖时自动回退。
 
-    回退链：sense-voice → sherpa → faster-whisper（若已装）→ vosk。
+    回退链：sense-voice → paraformer → sherpa → faster-whisper（若已装）→ vosk。
     """
     engine_name = resolve_engine(cfg)
     if engine_name != cfg.get("engine", "sense-voice"):
@@ -544,6 +655,16 @@ def create_engine(cfg: dict):
             print(f"[warn] {e}", file=sys.stderr)
         except Exception as e:  # noqa: BLE001
             print(f"[warn] 识别引擎初始化失败: {e}", file=sys.stderr)
+        print("[warn] 自动回退到备用引擎。", file=sys.stderr)
+        engine_name = "paraformer"
+    if engine_name == "paraformer":
+        try:
+            import sherpa_onnx  # noqa: F401
+            return ParaformerEngine(cfg, sample_rate=sr)
+        except FileNotFoundError as e:
+            print(f"[warn] {e}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] paraformer 引擎初始化失败: {e}", file=sys.stderr)
         print("[warn] 自动回退到备用引擎。", file=sys.stderr)
         engine_name = "sherpa"
     if engine_name == "sherpa":
@@ -569,8 +690,8 @@ def create_engine(cfg: dict):
     return VoskEngine(vosk_model_path(cfg), sample_rate=sr)
 
 
-ENGINE_SIZE_MB = {"sense-voice": 228, "vosk": 42, "faster-whisper": 460,
-                  "sherpa": 0}
+ENGINE_SIZE_MB = {"sense-voice": 228, "paraformer": 217, "vosk": 42,
+                  "faster-whisper": 460, "sherpa": 0}
 
 
 def engine_model_ready(cfg: dict, engine: Optional[str] = None) -> bool:
@@ -578,6 +699,8 @@ def engine_model_ready(cfg: dict, engine: Optional[str] = None) -> bool:
     engine = engine or cfg.get("engine", "sense-voice")
     if engine == "sense-voice":
         return sense_voice_ready(cfg)
+    if engine == "paraformer":
+        return paraformer_ready(cfg)
     if engine == "vosk":
         return os.path.isdir(vosk_model_path(cfg))
     if engine == "sherpa":
@@ -605,6 +728,8 @@ def download_engine_model(cfg: dict, engine: Optional[str] = None,
     engine = engine or cfg.get("engine", "sense-voice")
     if engine == "sense-voice":
         download_sense_voice(cfg, progress=progress)
+    elif engine == "paraformer":
+        download_paraformer(cfg, progress=progress)
     elif engine == "vosk":
         download_vosk_model(cfg, progress=progress)
     elif engine == "sherpa":
@@ -632,6 +757,47 @@ def list_microphones() -> List[dict]:
         return []
 
 
+def measure_mic_rms(idx: int) -> float:
+    """对指定设备短录 0.5 秒，返回 RMS 音量；失败返回 -1。"""
+    import time
+    try:
+        import sounddevice as sd
+    except Exception:  # noqa: BLE001
+        return -1.0
+    try:
+        d = sd.query_devices(idx)
+        sr = int(d.get("default_samplerate", 16000) or 16000)
+        frames: List[np.ndarray] = []
+
+        def cb(indata, _n, _t, _s) -> None:
+            frames.append(indata.copy())
+
+        with sd.InputStream(device=idx, samplerate=sr, channels=1,
+                            blocksize=int(sr * 0.1), callback=cb):
+            time.sleep(0.5)
+    except Exception:  # noqa: BLE001
+        return -1.0
+    if not frames:
+        return -1.0
+    arr = np.concatenate(frames)
+    return float(np.sqrt(np.mean(arr ** 2)))
+
+
+# 「这个设备真的在收音」的 RMS 下限：正常底噪与人声都在此之上。
+# 蓝牙耳麦"假连接"时录到的是 0.0000x 的电噪声，绝不能选中——
+# 否则老师说什么都被当噪音忽略
+MIN_LIVE_RMS = 5e-4
+
+
+def device_has_sound(idx: int) -> bool:
+    """指定设备现在能否录到像样的声音。
+
+    用于校验手动配置的设备是否仍有效：蓝牙耳麦"假连接"、设备已拔掉或
+    收不到音时都会低于阈值，应回退到自动挑选。
+    """
+    return measure_mic_rms(idx) >= MIN_LIVE_RMS
+
+
 def pick_mic_device() -> Optional[int]:
     """自动挑选真正有声音输入的麦克风。
 
@@ -639,42 +805,19 @@ def pick_mic_device() -> Optional[int]:
     有声音就直接用它；否则逐个设备短录 0.5 秒测音量，返回信号最强的；
     所有设备都录不到声音时返回 None（调用方提示检查麦克风权限）。
     """
-    import time
     try:
         import sounddevice as sd
         info = sd.query_devices()
     except Exception:  # noqa: BLE001
         return None
 
-    def measure(idx: int) -> float:
-        """对指定设备短录 0.5 秒，返回 RMS 音量；失败返回 -1。"""
-        d = sd.query_devices(idx)
-        sr = int(d.get("default_samplerate", 16000) or 16000)
-        try:
-            frames: List[np.ndarray] = []
-
-            def cb(indata, _n, _t, _s) -> None:
-                frames.append(indata.copy())
-
-            with sd.InputStream(device=idx, samplerate=sr, channels=1,
-                                blocksize=int(sr * 0.1), callback=cb):
-                time.sleep(0.5)
-        except Exception:  # noqa: BLE001
-            return -1.0
-        if not frames:
-            return -1.0
-        arr = np.concatenate(frames)
-        return float(np.sqrt(np.mean(arr ** 2)))
-
-    # 1) 先试系统默认输入设备：录到像样的信号（≥0.0005，正常底噪/人声水平）
-    #    才直接采用。蓝牙耳麦"假连接"时录到的是 0.0000x 的电噪声，
-    #    绝不能选（否则老师说什么都被当噪音忽略）
+    # 1) 先试系统默认输入设备：录到像样的信号才直接采用
     try:
         def_idx = sd.default.device[0]
         if def_idx is not None and int(def_idx) >= 0:
             name = sd.query_devices(def_idx).get("name", f"设备{def_idx}")
-            rms = measure(int(def_idx))
-            ok = rms >= 5e-4
+            rms = measure_mic_rms(int(def_idx))
+            ok = rms >= MIN_LIVE_RMS
             print(f"[mic] 默认输入 设备{def_idx} [{name}]: RMS={rms:.6f}"
                   f"{' (选中)' if ok else ' (几乎无声，跳过)'}", flush=True)
             if ok:
@@ -683,16 +826,13 @@ def pick_mic_device() -> Optional[int]:
         pass
 
     # 2) 默认输入无声（未连接/虚拟设备），再逐个实测所有输入设备
-    mics = []
-    for i, d in enumerate(info):
-        if d.get("max_input_channels", 0) <= 0:
-            continue
-        mics.append((i, d.get("name", "")))
-
     best_idx: Optional[int] = None
     best_rms = 0.0
-    for idx, name in mics:
-        rms = measure(idx)
+    for idx, d in enumerate(info):
+        if d.get("max_input_channels", 0) <= 0:
+            continue
+        name = d.get("name", "")
+        rms = measure_mic_rms(idx)
         if rms < 0:
             print(f"[mic] 设备{idx} [{name}]: 无法录音", flush=True)
             continue
@@ -700,4 +840,4 @@ def pick_mic_device() -> Optional[int]:
               f"{' (有声)' if rms > 1e-3 else ' (静音)'}", flush=True)
         if rms > best_rms:
             best_rms, best_idx = rms, idx
-    return best_idx if best_rms >= 5e-4 else None
+    return best_idx if best_rms >= MIN_LIVE_RMS else None

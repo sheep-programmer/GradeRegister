@@ -94,6 +94,18 @@ def block_rms(block: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(block)))) if block.size else 0.0
 
 
+def remove_dc(audio: np.ndarray) -> np.ndarray:
+    """去掉整块的直流偏移。
+
+    部分声卡/驱动会给录音叠一个固定偏置，识别器对输入偏置敏感，
+    喂给引擎之前先减掉块内均值。语音块只有 0.2 秒，减均值几乎
+    不影响人声，主要消掉的是直流与极低频噪声。
+    """
+    if audio.size == 0:
+        return audio
+    return audio - audio.mean()
+
+
 class SpeechGate:
     """判断一块音频算不算人声，门槛随环境底噪自适应。
 
@@ -294,10 +306,19 @@ class Recorder:
         self.cfg = cfg
         self.emit = emit
         self.engine = None
+        # 本次运行自动挑中的麦克风。只在内存里，绝不写回配置——
+        # 蓝牙耳机连上/断开后设备编号会变，固化下来下次就选到收不到声的设备
+        self.device_override: Optional[int] = None
         self._recording = False
         self._thread: Optional[threading.Thread] = None
 
     # ---------------- 状态 ----------------
+    def active_device(self):
+        """本次实际使用的麦克风：自动挑中的优先，否则用配置里手动指定的。"""
+        if self.device_override is not None:
+            return self.device_override
+        return self.cfg.get("device")
+
     @property
     def recording(self) -> bool:
         return self._recording
@@ -332,7 +353,7 @@ class Recorder:
         engine = self.engine
         engine.begin()
         want_rate = int(self.cfg.get("sample_rate", 16000))
-        device = self.cfg.get("device")
+        device = self.active_device()
         # 设备不一定支持 16k（Windows 尤其常见），开不了就换个能开的，
         # 录到的音频再降回引擎要的采样率
         rate = pick_samplerate(sd, device, want_rate)
@@ -356,6 +377,7 @@ class Recorder:
             if not self._recording:
                 raise sd.CallbackStop
             block = indata.astype(np.float32) / 32768.0   # 统一归一化到 0~1
+            block = remove_dc(block.reshape(-1)).reshape(-1, 1)
             if rate != want_rate:
                 block = resample_to(block.reshape(-1), rate,
                                     want_rate).reshape(-1, 1)

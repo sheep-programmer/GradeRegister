@@ -8,8 +8,9 @@ from grade_app import speech
 from grade_app.config import load_config
 from grade_app.platform_support import ensure_utf8_output
 
-SIZES = {"sense-voice": "约 228MB", "vosk": "约 42MB",
-         "faster-whisper": "约 460MB", "sherpa": "随项目自带"}
+SIZES = {"sense-voice": "约 228MB", "paraformer": "约 217MB",
+         "vosk": "约 42MB", "faster-whisper": "约 460MB",
+         "sherpa": "随项目自带"}
 
 
 def progress(done: int, total: int) -> None:
