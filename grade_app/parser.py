@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import difflib
 import re
+from functools import lru_cache
 from typing import Iterable, List, Optional
 
 # ---------------------------------------------------------------------------
@@ -17,7 +18,11 @@ CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 CN_UNITS = {"十": 10, "百": 100}
 
-_CN_NUM_RE = re.compile(r"[零一二两三四五六七八九十百]+")
+# 「点」要跟在数字后、且后面必须还有数字才算小数点：写成
+# `[…点]+` 会把「十三点」整段吃掉，而 cn_number_to_float 对没有小数位的
+# 「十三点」返回 None，那个 13 就被整段丢了
+_CN_NUM_RE = re.compile(
+    r"[零一二两三四五六七八九十百]+(?:点[零一二两三四五六七八九]+)?")
 _ARAB_RE = re.compile(r"\d+(?:\.\d+)?")
 
 
@@ -31,8 +36,10 @@ def cn_int_to_value(s: str) -> Optional[int]:
             num = CN_DIGITS[ch]
         elif ch in CN_UNITS:
             unit = CN_UNITS[ch]
-            # "十二" 这类十开头的写法：十 = 1*10
-            if unit == 10 and num == 0 and total == 0 and section == 0:
+            # 「十」前面没有数字时一律当 1×10：「十二」开头是这样，
+            # 「一百十」这种非标准念法也是——照旧只在句首放行的话，
+            # 那个「十」会乘 0 被吞掉，110 读成 100
+            if unit == 10 and num == 0:
                 num = 1
             section += num * unit
             num = 0
@@ -147,6 +154,20 @@ def find_total_marker(text: str, names: Iterable[str] = ()) -> tuple:
     return _find_total_by_pinyin(text, names)
 
 
+@lru_cache(maxsize=8192)
+def _sounds_like_total(win: str, size: int) -> bool:
+    """这个 size 字的窗口听上去是不是「总分」一类的词。
+
+    纯函数，缓存起来：一节课里同样的字窗（「第一题」「三分第」…）会被
+    反复比对，而 difflib 不便宜。
+    """
+    py = _pinyin(win)
+    if not py:
+        return False
+    return max(difflib.SequenceMatcher(None, py, target).ratio()
+               for target in _TOTAL_PINYIN[size]) >= _TOTAL_PINYIN_MIN
+
+
 def _find_total_by_pinyin(text: str, names: Iterable[str]) -> tuple:
     """按发音找总分关键词：「总分」常被听成「钟分」「充分」「钟晨」。
 
@@ -164,9 +185,7 @@ def _find_total_by_pinyin(text: str, names: Iterable[str]) -> tuple:
             win = stripped[start:start + size]
             if len(win) < size or win in name_set or is_number_text(win):
                 continue
-            py = _pinyin(win)
-            if py and max(difflib.SequenceMatcher(None, py, t).ratio()
-                          for t in _TOTAL_PINYIN[size]) >= _TOTAL_PINYIN_MIN:
+            if _sounds_like_total(win, size):
                 return keep[start], keep[start + size - 1] + 1
     return -1, -1
 
@@ -272,6 +291,7 @@ def remove_matched_names(text: str, names: Iterable[str]) -> str:
     return result
 
 
+@lru_cache(maxsize=8192)
 def is_number_text(text: str) -> bool:
     """判断清理后的文本是不是纯粹在念数字——纯数字绝不能当人名。
 
@@ -282,6 +302,26 @@ def is_number_text(text: str) -> bool:
     t = _SUFFIX_RE.sub("", clean_name_text(text))
     return bool(t) and all(ch in "零一二两三四五六七八九十百点．.0123456789"
                            for ch in t)
+
+
+# 「切到下一位学生」的指令说法；名单里有同音姓名时按姓名处理
+_NEXT_CMDS = frozenset({"下一个", "下一位", "下个", "继续", "接着来", "下一名"})
+
+
+def is_next_student_cmd(text: str, names: Iterable[str] = ()) -> bool:
+    """识别文本是不是「切到下一位未录学生」的指令。
+
+    「继续」这类词可能与学生姓名同音（纪旭/继续），名单里有发音几乎
+    相同的名字时按姓名处理，绝不吞掉点名。
+    """
+    t = clean_name_text(text)
+    if t not in _NEXT_CMDS:
+        return False
+    for n in names:
+        n = str(n).strip()
+        if n and len(n) >= 2 and pinyin_similarity(t, n) >= 0.85:
+            return False
+    return True
 
 
 def match_student_names(text: str, names: Iterable[str], cutoff: float = 0.45) -> List[str]:
@@ -422,7 +462,7 @@ def extract_score_items(text: str, strip_prefix: bool = True,
     一个「分」字只结算一个分数，取紧挨着它的那个数：「第一题十五分」被
     听成「七月十五分」时只认 15，不能把 7 也当成一道题的分数。
     """
-    text = (text or "").translate(_MISHEAR_TO_NUM)
+    text = text or ""
     header_map = named_header_map(headers)
     items: List[tuple] = []
     # 「加/和/与」是明确分隔：切出的每段都视为有效分数（如 10加5加5加3）
@@ -434,6 +474,9 @@ def extract_score_items(text: str, strip_prefix: bool = True,
             groups = (_split_by_head(tok, header_map) if strip_prefix
                       else [(None, tok)])
             for q, seg in groups:
+                # 同音纠正只作用于数字提取：题头切分与表头匹配必须用原文，
+                # 否则表头「物理」会被「误→五」之类的映射改坏
+                seg = seg.translate(_MISHEAR_TO_NUM)
                 # 分数须带「分」字，或用分隔词隔开；防「10和5」被粘连误读成 15
                 has_fen = "分" in seg or split_by_sep
                 if strip_suffix:
@@ -514,6 +557,9 @@ except Exception:  # noqa: BLE001
     _lazy_pinyin = None
 
 
+# 一份名单里的姓名与表头在整场录入中反复参与比对，拼音转换是纯函数，
+# 缓存后同一个词只算一次
+@lru_cache(maxsize=4096)
 def _pinyin(s: str) -> str:
     if _lazy_pinyin is None:
         return ""
@@ -534,6 +580,7 @@ _INITIAL_WEIGHT = 0.35
 _FINAL_WEIGHT = 0.65
 
 
+@lru_cache(maxsize=4096)
 def _split_syllables(s: str) -> tuple:
     """把词拆成 (声母列表, 韵母列表)，逐字对齐用。"""
     if _lazy_pinyin is None:
@@ -567,6 +614,7 @@ def _syllable_similarity(i1: str, f1: str, i2: str, f2: str) -> float:
     return _INITIAL_WEIGHT * si + _FINAL_WEIGHT * sf
 
 
+@lru_cache(maxsize=16384)
 def pinyin_similarity(a: str, b: str) -> float:
     """两个词读音有多像（0~1），逐字对齐比声母与韵母。
 
@@ -621,10 +669,9 @@ def rank_names_by_pinyin(token: str, names: Iterable[str],
     return scored
 
 
-def best_name_by_pinyin(token: str, names: Iterable[str],
-                        prefer: Iterable[str] = ()) -> tuple:
-    """返回 (最佳姓名, 相似度)：token 与哪个学生姓名发音最接近。"""
-    ranked = rank_names_by_pinyin(token, names, prefer)
+def _best_from_ranking(ranked: List[tuple],
+                       prefer: Iterable[str] = ()) -> tuple:
+    """从排好的名次里挑最佳，返回 (姓名, 相似度)。"""
     if not ranked:
         return "", 0.0
     # 头名与次名难分时，让 prefer 里的那个胜出
@@ -638,12 +685,32 @@ def best_name_by_pinyin(token: str, names: Iterable[str],
     return ranked[0]
 
 
-def is_name_ambiguous(token: str, names: Iterable[str]) -> bool:
-    """发音上分不出是哪位学生——该弹候选框而不是替老师猜。"""
-    ranked = rank_names_by_pinyin(token, names)
+def _ranking_is_ambiguous(ranked: List[tuple]) -> bool:
+    """这份名次分不出头名——该弹候选框而不是替老师猜。
+
+    只看前两位的相似度。prefer 只在同分时重排顺序，前两位的分数不受它
+    影响，所以带不带 prefer 排出来的名次喂进来结果一样。
+    """
     if len(ranked) < 2 or ranked[0][1] < _NAME_FIX_THRESHOLD:
         return False
     return ranked[0][1] - ranked[1][1] < _NAME_AMBIGUOUS_GAP
+
+
+def best_name_by_pinyin(token: str, names: Iterable[str],
+                        prefer: Iterable[str] = ()) -> tuple:
+    """返回 (最佳姓名, 相似度)：token 与哪个学生姓名发音最接近。"""
+    return _best_from_ranking(rank_names_by_pinyin(token, names, prefer),
+                              prefer)
+
+
+def is_name_ambiguous(token: str, names: Iterable[str]) -> bool:
+    """发音上分不出是哪位学生——该弹候选框而不是替老师猜。"""
+    return _ranking_is_ambiguous(rank_names_by_pinyin(token, names))
+
+
+def _is_repeated_char(word: str) -> bool:
+    """整个词是同一个字重复（「第第」「丽丽丽」）。单字不算。"""
+    return len(word) >= 2 and len(set(word)) == 1
 
 
 def correct_names_in_text(text: str, names: Iterable[str],
@@ -660,13 +727,29 @@ def correct_names_in_text(text: str, names: Iterable[str],
     name_list = [str(n).strip() for n in names if str(n).strip()]
     if not name_list:
         return text, []
+    # 名单里本来就有叠字姓名（丽丽）时才允许把叠字往姓名上纠
+    allow_repeat = any(_is_repeated_char(n) for n in name_list)
     fixed: List[str] = []
     out_tokens = []
     for tok in text.split():
         t = clean_name_text(tok)
-        if (t and len(t) >= 2 and not is_number_text(t)
-                and not is_name_ambiguous(t, name_list)):
-            best, r = best_name_by_pinyin(t, name_list, prefer)
+        if t and not allow_repeat and _is_repeated_char(t):
+            # 噪声与口吃经 collapse_repeats 折叠后就是叠字（「第第第第」→「第第」）。
+            # 叠字的两个音节完全相同，跟任何「声母不同、韵母相同」的姓名都算得
+            # 很像（didi vs lisi 有 0.65），而真实误听最低只有 0.58——两段区间
+            # 重叠，调阈值分不开，只能按结构挡掉。
+            # 名单里真有叠字姓名的话精确匹配自会命中，不靠这条纠错
+            out_tokens.append(tok)
+            continue
+        if t and len(t) >= 2 and not is_number_text(t):
+            # 名次只排一次：歧义判定与挑最佳都从同一份名次里取。
+            # 分开调 is_name_ambiguous 与 best_name_by_pinyin 会把整份名单
+            # 排两遍，这里是整条语音链路上最热的一段
+            ranked = rank_names_by_pinyin(t, name_list, prefer)
+            if _ranking_is_ambiguous(ranked):
+                out_tokens.append(tok)
+                continue
+            best, r = _best_from_ranking(ranked, prefer)
             if r >= _NAME_FIX_THRESHOLD:
                 out_tokens.append(best)
                 if best != t:
@@ -719,11 +802,21 @@ def correct_headers_in_text(text: str, headers: Iterable[str],
 
 
 # 同音误听纠正：小模型常把「十」听成「时/是/石」，「四」听成「斯/丝」。
-# 仅用于分数提取前的文本规范化（此时姓名已剔除，不会伤到人名）
+# 仅用于分数提取前的文本规范化（此时姓名已剔除，不会伤到人名）。
+# 覆盖高频的整段同音：十五→失误/食物/什伍，十七→时期，十八→是吧，
+# 十二→时而/十二，九→酒/久，三→伞，四→肆。
+# 表头匹配不经过这张表（extract_score_items 只在数字提取时做同音纠正），
+# 所以「误→五」不会把表头「物理」改坏
 _MISHEAR_TO_NUM = str.maketrans({
     "时": "十", "是": "十", "石": "十", "识": "十", "拾": "十",
-    "斯": "四", "丝": "四", "私": "四",
-    "气": "七", "齐": "七", "起": "七",
+    "失": "十", "实": "十", "蚀": "十",
+    "斯": "四", "丝": "四", "私": "四", "肆": "四",
+    "气": "七", "齐": "七", "起": "七", "期": "七", "妻": "七", "漆": "七",
+    "误": "五", "伍": "五", "午": "五", "雾": "五", "武": "五",
+    "而": "二", "耳": "二",
+    "吧": "八", "巴": "八",
+    "酒": "九", "久": "九",
+    "伞": "三",
     # 「分」的同音：七分常被听成「气氛」，三分听成「三粉」。
     # 「芬」不收——它是常见人名用字（李芬），改了会伤到点名
     "氛": "分", "粉": "分", "份": "分",
