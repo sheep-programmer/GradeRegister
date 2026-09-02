@@ -6,13 +6,14 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 # ---------------------------------------------------------------------------
@@ -27,6 +28,7 @@ class StudentRecord:
     scores: Dict[int, float] = field(default_factory=dict)   # col(0基) -> 分数
     total: Optional[float] = None
     checked: Optional[bool] = None   # True=一致 False=不一致 None=未核对
+    spoken_total: Optional[float] = None   # 核对时老师念的总分，仅不一致时留着
 
 
 @dataclass
@@ -38,6 +40,7 @@ class SheetModel:
     score_cols: List[int] = field(default_factory=list)
     total_col: int = -1
     check_col: int = -1
+    header_row: int = 1            # 表头所在的 1 基行号（上方可能有标题行）
     id_col: int = -1            # 学号/座号列，-1 表示表里没有
     students: List[StudentRecord] = field(default_factory=list)
 
@@ -68,6 +71,37 @@ def _contains_any(text: str, keys: Tuple[str, ...]) -> bool:
 
 
 _ID_HEADERS = ("学号", "座号", "编号", "考号", "序号")
+
+
+def _header_score(cells: List[str]) -> int:
+    """这一行像不像表头。分数越高越像。"""
+    if not any(cells):
+        return -1
+    score = 0
+    if any(_contains_any(h, ("姓名", "名字", "学生")) for h in cells):
+        score += 3
+    if any(_contains_any(h, ("总分", "总成绩", "总计", "合计")) for h in cells):
+        score += 2
+    score += sum(1 for h in cells if _contains_any(h, ("题",)))
+    return score
+
+
+def find_header_row(ws, max_scan: int = 10) -> int:
+    """表头所在的 1 基行号。
+
+    老师的表常在上面留标题行（「三年级期中成绩」）或空行。写死第一行的话，
+    标题行会被当成表头、真表头会被当成一个叫「姓名」的学生，整表错位，
+    而且一声不响。
+    """
+    best_row, best = 1, -1
+    upto = min(max_scan, ws.max_row or 1)
+    for row in range(1, upto + 1):
+        cells = [str(c.value).strip() if c.value is not None else ""
+                 for c in ws[row]]
+        score = _header_score(cells)
+        if score > best:
+            best_row, best = row, score
+    return best_row
 
 
 def identify_columns(header: List[str], cfg: dict) -> Tuple[int, List[int], int, int, int]:
@@ -109,6 +143,12 @@ def identify_columns(header: List[str], cfg: dict) -> Tuple[int, List[int], int,
     # 兜底：姓名列与总分列之间的所有列都算题号列（学号列除外）
     if not score_cols and total_col - name_col > 1:
         score_cols = [i for i in range(name_col + 1, total_col) if i != id_col]
+    # 总分列不在最右边时（如 姓名|总分|第一题|第二题），题目列全在它右边，
+    # 上面按「夹在姓名与总分之间」找会一个都找不到，整张表一道题都录不进去
+    if not score_cols:
+        score_cols = [i for i, h in enumerate(header)
+                      if i not in (name_col, total_col, id_col)
+                      and (_contains_any(h, ("题",)) or h.strip().isdigit())]
 
     # 核对列：总分列之后含"核对/核查/检查/确认"的表头列，否则第一个空表头列
     check_col = total_col + 1
@@ -136,7 +176,9 @@ def load_sheet(path: str, cfg: dict, backup: bool = True) -> SheetModel:
 
     wb = load_workbook(path)
     ws = wb.active
-    header = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
+    header_row = find_header_row(ws)
+    header = [str(c.value).strip() if c.value is not None else ""
+              for c in ws[header_row]]
 
     name_col, score_cols, total_col, check_col, id_col = identify_columns(
         header, cfg)
@@ -155,10 +197,11 @@ def load_sheet(path: str, cfg: dict, backup: bool = True) -> SheetModel:
         score_cols=score_cols,
         total_col=total_col,
         check_col=check_col,
+        header_row=header_row,
         id_col=id_col,
     )
 
-    for xl_row in range(2, ws.max_row + 1):   # openpyxl 1基行号
+    for xl_row in range(header_row + 1, ws.max_row + 1):   # openpyxl 1基行号
         name_val = ws.cell(row=xl_row, column=name_col + 1).value
         if name_val is None or str(name_val).strip() == "":
             continue
@@ -177,13 +220,23 @@ def load_sheet(path: str, cfg: dict, backup: bool = True) -> SheetModel:
         tv = ws.cell(row=xl_row, column=total_col + 1).value
         if isinstance(tv, (int, float)) and not isinstance(tv, bool):
             stu.total = float(tv)
-        stu.checked = _read_checked(ws.cell(row=xl_row, column=check_col + 1).value)
+        elif stu.scores:
+            # 总分列存的是 =SUM() 时 openpyxl 读回来的是公式字符串。
+            # 照着已有分数自己算一遍，否则重开文件后总分列一片空白
+            stu.total = model.calc_total(stu)
+        check_val = ws.cell(row=xl_row, column=check_col + 1).value
+        stu.checked = _read_checked(check_val)
+        if stu.checked is False:
+            stu.spoken_total = _read_spoken_total(check_val)
         model.students.append(stu)
     return model
 
 
 _CHECK_OK_MARKS = frozenset({"✓", "✔", "√", "对", "ok", "yes", "一致", "正确"})
 _CHECK_BAD_MARKS = frozenset({"✗", "✘", "×", "x", "错", "不一致", "错误"})
+# 不一致时写的是「不一致（报62 算58）」，整体比对认不出来，按前缀认
+_CHECK_BAD_PREFIX = "不一致"
+_SPOKEN_RE = re.compile(r"报\s*(-?\d+(?:\.\d+)?)")
 
 
 def _read_checked(value) -> Optional[bool]:
@@ -197,11 +250,31 @@ def _read_checked(value) -> Optional[bool]:
     text = str(value).strip().lower()
     if not text:
         return None
-    if text in _CHECK_BAD_MARKS:
+    if text in _CHECK_BAD_MARKS or text.startswith(_CHECK_BAD_PREFIX):
         return False
     if text in _CHECK_OK_MARKS:
         return True
     return None
+
+
+def _read_spoken_total(value) -> Optional[float]:
+    """从「不一致（报62 算58）」里取回老师当时报的那个数。"""
+    if value is None:
+        return None
+    m = _SPOKEN_RE.search(str(value))
+    return float(m.group(1)) if m else None
+
+
+def check_mark_text(stu: StudentRecord) -> str:
+    """核对列该写什么。
+
+    不一致时把老师报的数一并写出来：只写「不一致」的话，老师得自己回头
+    对一遍才知道差在哪；把两个数摆在一起，差多少一眼看得见。
+    """
+    if stu.spoken_total is None:
+        return "不一致"
+    expected = stu.total if stu.total is not None else 0.0
+    return f"不一致（报{stu.spoken_total:g} 算{expected:g}）"
 
 
 BACKUP_KEEP = 20        # 每份表格保留的备份数量上限
@@ -237,6 +310,17 @@ def _prune_backups(backup_dir: str, base: str, ext: str, keep: int) -> None:
             pass
 
 
+def _center(cell) -> None:
+    """把单元格设为水平垂直居中，其余对齐属性（换行、缩进等）原样保留。"""
+    a = cell.alignment
+    if a.horizontal == "center" and a.vertical == "center":
+        return
+    cell.alignment = Alignment(
+        horizontal="center", vertical="center",
+        text_rotation=a.text_rotation, wrap_text=a.wrap_text,
+        shrink_to_fit=a.shrink_to_fit, indent=a.indent)
+
+
 _RED_FILL = PatternFill(start_color="FFFFC7CE", end_color="FFFFC7CE", fill_type="solid")
 _RED_FONT = Font(color="FF9C0006", bold=True)
 _GREEN_FONT = Font(color="FF006100")
@@ -254,7 +338,7 @@ def save_sheet(model: SheetModel, cfg: dict, write_formula: bool = True) -> str:
     ws = wb[model.sheet_name]
 
     # 确保核对列表头存在
-    check_header = ws.cell(row=1, column=model.check_col + 1)
+    check_header = ws.cell(row=model.header_row, column=model.check_col + 1)
     if check_header.value is None or str(check_header.value).strip() == "":
         check_header.value = cfg.get("check_header", "核对")
 
@@ -306,9 +390,35 @@ def save_sheet(model: SheetModel, cfg: dict, write_formula: bool = True) -> str:
                 cell.fill = PatternFill()
                 cell.font = Font()
         else:
-            cell.value = "不一致"
+            cell.value = check_mark_text(stu)
             cell.fill = _RED_FILL
             cell.font = _RED_FONT
 
+    _center_used_range(ws, model)
     wb.save(model.path)
     return model.path
+
+
+def _center_used_range(ws, model: SheetModel) -> None:
+    """表头行与各学生行一律居中，跟软件里看到的表格保持一致。"""
+    last_col = max(model.check_col, len(model.header) - 1)
+    for col in range(last_col + 1):
+        _center(ws.cell(row=model.header_row, column=col + 1))
+    for stu in model.students:
+        for col in range(last_col + 1):
+            _center(ws.cell(row=stu.row + 1, column=col + 1))
+    # 核对列要放下「不一致（报90 算100）」，默认宽度会显示成 ####
+    letter = get_column_letter(model.check_col + 1)
+    need = max([_display_width(
+                    ws.cell(row=model.header_row,
+                            column=model.check_col + 1).value)]
+               + [_display_width(check_mark_text(s) if s.checked is False
+                                 else "✓" if s.checked else "")
+                  for s in model.students]) + 2
+    if (ws.column_dimensions[letter].width or 0) < need:
+        ws.column_dimensions[letter].width = need
+
+
+def _display_width(value) -> int:
+    """Excel 列宽按半角字符数算，汉字与全角标点各占两格。"""
+    return sum(2 if ord(ch) > 0x2E7F else 1 for ch in str(value or ""))

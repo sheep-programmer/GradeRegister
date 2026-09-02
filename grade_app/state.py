@@ -17,6 +17,10 @@ from typing import List, Optional
 from . import parser
 from .excel_io import SheetModel, StudentRecord
 
+# 单题分数的上限。识别偶尔会把一串数字连成「99999999999999999999」，
+# 填进去会毁掉总分和整张表的可读性，而老师未必留意到多了十几位
+MAX_SCORE = 1000.0
+
 
 @dataclass
 class ActionResult:
@@ -26,6 +30,7 @@ class ActionResult:
     select_choices: Optional[List[tuple]] = None   # [(row, name)] 重名/候选选择
     ok: bool = True
     heard_text: Optional[str] = None   # 纠正后实际采用的文本，供界面显示
+    sound: Optional[str] = None        # 指定提示音；None 表示按 ok 取默认
 
 
 @dataclass
@@ -40,6 +45,10 @@ class AppState:
     _pending_q: Optional[float] = field(default=None, repr=False)    # 念了题号还没念分
     # 听不清是谁时列出的候选，等老师用一句「第一个」来定
     _pending_choices: Optional[List[tuple]] = field(default=None, repr=False)
+    # 同名多位、等老师选人时暂存的整句，选完照它把分数与总分补上
+    _pending_line: Optional[str] = field(default=None, repr=False)
+    # 最近一次自动保存的失败原因，供界面提示；成功则回到 None
+    save_error: Optional[str] = field(default=None, repr=False)
 
     # ---------------- 加载 ----------------
     def load(self, model: SheetModel) -> None:
@@ -47,6 +56,37 @@ class AppState:
         self.phase = "idle"
         self.current = None
         self.undo_stack.clear()
+        self.save_error = None
+        # 换表比换学生更彻底，逐项残留都会让新表出现莫名其妙的行为：
+        # 悬着的题号会把下一个分数填到错的那一题，旧的编辑列会在新表上
+        # 亮起一个从没填过的格子
+        self._clear_pending()
+        # 待补整句是「选完人就接着填」的跨激活传递，不属于切学生要清的那组，
+        # 但换表必须清——它指的是旧表里的学生
+        self._pending_line = None
+
+    def _clear_pending(self) -> None:
+        """清掉只对「当前这一位学生」有意义的临时状态。
+
+        切学生与切表格都要清同一组字段。分散在两处写迟早会漏一个，
+        所以收在这里。
+        """
+        self._pending_choices = None
+        self._pending_q = None
+        self._last_edit_col = None
+
+    def student_no(self, stu: StudentRecord) -> int:
+        """学生在名单里的第几位（1 起）。
+
+        界面与语音一律用这个序号，不用 Excel 行号：老师念「第五个」指的
+        是名单第五位，表头行、空行让两者错开，对不上就会点错人。
+        """
+        if self.model is None:
+            return 0
+        for i, s in enumerate(self.model.students, start=1):
+            if s.row == stu.row:
+                return i
+        return 0
 
     def _score_headers(self) -> List[str]:
         """各分数列的表头文字，顺序与 score_cols 一致。"""
@@ -101,6 +141,33 @@ class AppState:
         stu = self.model.students[idx]
         return self._activate(stu.name, stu.row, exact=True)
 
+    # ---------------- 下一位学生 ----------------
+    def _next_unfinished(self, after: Optional[StudentRecord] = None):
+        """after 之后第一个还没录完的学生（绕回名单开头找）；没有返回 None。"""
+        if self.model is None or not self.model.students:
+            return None
+        students = self.model.students
+        start = 0
+        if after is not None:
+            cur = next((i for i, s in enumerate(students) if s.row == after.row),
+                       -1)
+            start = cur + 1
+        for off in range(len(students)):
+            stu = students[(start + off) % len(students)]
+            if self.model.filled_count(stu) < self.model.score_count:
+                return stu
+        return None
+
+    def next_student(self) -> ActionResult:
+        """切到名单里下一位还没录完的学生；全录完给出提示。"""
+        if self.model is None:
+            return ActionResult(message="还没有打开表格", ok=False)
+        stu = self._next_unfinished(after=self.current)
+        if stu is None:
+            return ActionResult(
+                message="全班都已录完，可以点「保存」或直接关闭程序", ok=False)
+        return self._activate(stu.name, stu.row, exact=True)
+
     # ---------------- 学生选择 ----------------
     def select_student(self, text: str) -> ActionResult:
         """按名字选择学生；返回可能的重名/候选选择项。
@@ -146,11 +213,17 @@ class AppState:
         )
 
     def activate_row(self, row: int) -> ActionResult:
-        """弹窗确认后激活指定行。"""
+        """弹窗确认后激活指定行；有暂存的整句就顺势补完。"""
         assert self.model is not None
         for s in self.model.students:
             if s.row == row:
-                return self._activate(s.name, s.row, exact=False)
+                act = self._activate(s.name, s.row, exact=False)
+                line, self._pending_line = self._pending_line, None
+                if line and act.ok:
+                    done = self._apply_scored_line(line)
+                    done.message = f"{act.message}；{done.message}"
+                    return done
+                return act
         return ActionResult(message="选择无效", ok=False)
 
     def _activate(self, name: str, row: int, exact: bool) -> ActionResult:
@@ -159,11 +232,12 @@ class AppState:
             if s.row == row:
                 self.current = s
                 self.phase = "scoring"
-                self._pending_choices = None   # 已经定了人，旧候选作废
-                self._last_edit_col = None   # 切学生，清掉旧格子高亮
-                self._pending_q = None       # 上一位学生没念完的题号不带过来
+                # 已经定了人：旧候选作废、旧格子高亮清掉、
+                # 上一位没念完的题号不带过来
+                self._clear_pending()
                 rest = self.model.score_count - self.model.filled_count(s)
-                msg = (f"已选中：{name}（第{row + 1}行）"
+                # 行号跟 Excel 对得上，序号是念「第几个」用的，两个都写出来
+                msg = (f"已选中：{name}（第{row + 1}行 · 第{self.student_no(s)}个）"
                        + (f"，还有 {rest} 题未填，请念分数" if rest > 0
                           else "，各题已填完，可核对总分或念下一位"))
                 return ActionResult(message=msg, new_phase="scoring")
@@ -257,9 +331,15 @@ class AppState:
         self._pending_q = None
         dropped_no_q = 0   # 没带题号、且已无空题可填而被丢弃的分数
         changes: List[tuple] = []        # 这一句的全部改动，整组一次撤销
+        absurd = 0     # 大到不可能是分数、只能是听错的值
         for q, v in items:
             if v is None:
                 pending_q = q   # 只有题头：记住，等下一个分数补上
+                continue
+            if v > MAX_SCORE:
+                # 识别把一串数字连成了「99999999999」这种。填进去会把总分
+                # 和整张表搞得没法看，而且老师未必留意到多了几位
+                absurd += 1
                 continue
             if q is None and pending_q is not None:
                 q, pending_q = pending_q, None
@@ -294,6 +374,7 @@ class AppState:
             self.undo_stack.append(changes)
         if filled or fixed_cnt:
             stu.checked = None   # 分数变了，上一轮的核对结论作废
+            stu.spoken_total = None
         stu.total = self.model.calc_total(stu)
         blanks_left = [c for c in self.model.score_cols if c not in stu.scores]
 
@@ -316,6 +397,8 @@ class AppState:
             col = self._col_of_question(pending_q)
             label = (self._question_label(col) if col is not None
                      else f"第{int(pending_q)}题")
+            if changes:
+                self._maybe_autosave("score")
             return ActionResult(
                 message=f"{stu.name} 已填 {len(filled)} 题，还剩 {len(blanks_left)} 题"
                         f"（「{label}」的分数还没听到，请继续念）{extra}",
@@ -331,6 +414,8 @@ class AppState:
                          f"可念「总分 {stu.total:g}」核对，或直接念下一位学生")
         if skipped:
             parts.append(f"{skipped} 个分数的题号超出范围，已忽略")
+        if absurd:
+            parts.append(f"{absurd} 个数字大于 {MAX_SCORE:g}，不像分数，已忽略")
         if dropped_no_q:
             parts.append(f"{dropped_no_q} 个分数没地方填（各题已满），"
                          "要改分请带上题号")
@@ -361,14 +446,70 @@ class AppState:
         same = abs(spoken - expected) < 1e-9
         stu.checked = same
         if same:
+            stu.spoken_total = None
             msg = f"✓ 一致：{stu.name} 总分 {expected:g}，核对完成"
             self.phase = "idle"
+            # 设置里开了「录完自动切下一位」：直接激活名单里下一位未录完的
+            if self.cfg.get("auto_next"):
+                nxt = self._next_unfinished(after=stu)
+                if nxt is not None:
+                    self._activate(nxt.name, nxt.row, exact=True)
+                    msg += f"；已自动切到下一位：{nxt.name}"
+            sound, ok = "success", True
         else:
-            msg = (f"✗ 不一致：你说的 {spoken:g}，软件计算 {expected:g}，"
-                   "已在该行「核对」列标红，可再核实")
+            # 报的数留在记录里，核对列会连差值一起写出来
+            stu.spoken_total = spoken
+            diff = spoken - expected
+            msg = (f"✗ 不一致：你说的 {spoken:g}，软件计算 {expected:g}"
+                   f"（差 {diff:+g}），已在该行「核对」列标红，可再核实")
             self.phase = "idle"
-        self._maybe_autosave("student")   # 核对完这一位就算录完了
-        return ActionResult(message=msg, new_phase=self.phase)
+            sound, ok = "error", False
+        # 核对通过是最靠后的时机；不一致时按「一位学生录完」算，
+        # checked 模式下就不写盘——老师要的是只把对得上的结果同步出去
+        self._maybe_autosave("checked" if same else "student")
+        return ActionResult(message=msg, new_phase=self.phase, ok=ok,
+                            sound=sound)
+
+    # ---------------- 整句归属别的学生 ----------------
+    def _other_student_in(self, head: str) -> bool:
+        """总分关键词之前的那段，念的是不是当前学生以外的某个人。"""
+        if self.model is None or not head.strip():
+            return False
+        if parser.is_number_text(head):
+            return False
+        rows = parser.find_student_rows(
+            head, [(s.row, s.name) for s in self.model.students],
+            cutoff=self.cfg.get("score_cutoff", 0.55))
+        if not rows:
+            return False
+        cur_row = self.current.row if self.current else None
+        return any(row != cur_row for row, _name in rows)
+
+    def _scored_line_for_other(self, text: str, head: str) -> ActionResult:
+        """处理「别人的名字 + 各题分数 + 总分」这一整句。"""
+        act = self.select_student(head)
+        if act.select_choices or not act.ok:
+            # 同名多位或没听清：先让老师定人，这一句留着，选完再照它补
+            self._pending_line = text
+            act.message += "（选定后会自动补上这一句的分数与总分）"
+            return act
+        return self._apply_scored_line(text)
+
+    def _apply_scored_line(self, text: str) -> ActionResult:
+        """当前学生已定，把这一句的各题分数填上再核对总分。"""
+        assert self.model is not None
+        names = [s.name for s in self.model.students]
+        head, _tail = parser.split_at_total(text, names)
+        rest = parser.remove_matched_names(head, names)
+        kw = dict(strip_prefix=self.cfg.get("strip_prefix", True),
+                  strip_suffix=self.cfg.get("strip_suffix", True))
+        parts = []
+        if rest.strip() and parser.extract_scores(rest, **kw):
+            parts.append(self._fill_scores(rest).message)
+        act = self.check_total(text)
+        if parts:
+            act.message = "；".join(parts + [act.message])
+        return act
 
     def pending_col(self) -> Optional[int]:
         """已念题号、还等着分数的那一列，供界面把格子标出来。"""
@@ -421,6 +562,7 @@ class AppState:
         for stu in touched:
             stu.total = self.model.calc_total(stu)
             stu.checked = None    # 分数变了，上一轮的核对结论作废
+            stu.spoken_total = None
         self.undo_stack.append(changes)
         self._last_edit_col = changes[-1][1]
         self._maybe_autosave("score")
@@ -451,6 +593,7 @@ class AppState:
         for stu in touched:
             stu.total = self.model.calc_total(stu) if self.model else None
             stu.checked = None   # 分数被改回去了，核对结论同样作废
+            stu.spoken_total = None
         self._last_edit_col = group[-1][1]
         if len(group) == 1:
             stu, col, _old = group[0]
@@ -461,26 +604,40 @@ class AppState:
             msg = f"已撤销 {len(touched)} 位学生共 {len(group)} 处改动"
         return ActionResult(message=msg, new_phase="scoring")
 
+    # 写盘时机的严格程度。事件的级别 ≥ 模式要求的级别才落盘，
+    # 所以「核对通过」这种最靠后的事件在任何非手动模式下都会写
+    _SAVE_LEVELS = {"score": 0, "student": 1, "checked": 2}
+
     def auto_save_mode(self) -> str:
-        """score=每填一个分数存 | student=每录完一位学生存 | manual=只手动存。"""
+        """score=每填一个分数存 | student=每录完一位存 | checked=核对通过才存
+        | manual=只手动存。"""
         mode = self.cfg.get("auto_save_mode")
-        if mode in ("score", "student", "manual"):
+        if mode in ("score", "student", "checked", "manual"):
             return mode
         return "score" if self.cfg.get("auto_save", True) else "manual"
 
     def _maybe_autosave(self, event: str = "score") -> None:
-        """event 是这次触发的时机：score=填了分数，student=一位学生录完。"""
+        """event 是这次触发的时机：score=填了分数，student=一位学生录完，
+        checked=总分核对通过。"""
         mode = self.auto_save_mode()
         if mode == "manual" or self.model is None:
             return
-        if mode == "student" and event != "student":
+        if self._SAVE_LEVELS.get(event, 0) < self._SAVE_LEVELS.get(mode, 0):
             return
         try:
             from .excel_io import save_sheet
             save_sheet(self.model, self.cfg,
                        write_formula=self.cfg.get("write_formula", True))
+            self.save_error = None
+        except PermissionError:
+            # Excel 开着同一份表时会锁住文件。只打日志的话老师毫无察觉，
+            # 一节课的分数全留在内存里，关掉程序就没了
+            self.save_error = ("自动保存失败：表格正被 Excel 占用。"
+                               "请关掉 Excel，或先点「保存」确认能写入")
+            print(f"[warn] {self.save_error}", flush=True)
         except Exception as e:  # noqa: BLE001
-            print(f"[warn] 自动保存失败: {e}")
+            self.save_error = f"自动保存失败：{e}"
+            print(f"[warn] {self.save_error}", flush=True)
 
     # ---------------- 统一输入入口 ----------------
     def handle_text(self, text: str) -> ActionResult:
@@ -490,6 +647,9 @@ class AppState:
             return ActionResult(message="没听清，请再说一次", ok=False)
         # 短音频常被吐成「李四李四李四」，先折叠再匹配，否则整串拼音跟谁都不像
         text = parser.collapse_repeats(text)
+        # 上一句留下的待补内容只对「紧接着选人」有效。老师改口说了别的，
+        # 那句就作废——否则等会儿随手点一行会莫名其妙被填上一堆旧分数
+        self._pending_line = None
 
         names = [s.name for s in self.model.students] if self.model else []
 
@@ -497,11 +657,31 @@ class AppState:
         # 必须赶在号码定位之前——「第一个」同时也是选号码的说法
         if self._pending_choices:
             idx = parser.parse_choice_index(text)
-            choices, self._pending_choices = self._pending_choices, None
-            if idx is not None and 0 <= idx < len(choices):
-                act = self.activate_row(choices[idx][0])
-                act.heard_text = text
-                return act
+            choices = self._pending_choices
+            if idx is not None:
+                if 0 <= idx < len(choices):
+                    self._pending_choices = None
+                    act = self.activate_row(choices[idx][0])
+                    act.heard_text = text
+                    return act
+                # 说了「第三个」而只有两个候选：候选留着让老师重说一次。
+                # 放行下去会被后面的号码定位当成「名单第 3 位」，
+                # 一句说岔的话就把当前学生换成了毫不相干的人
+                listed = "  ".join(f"{i + 1} {n}"
+                                   for i, (_r, n) in enumerate(choices))
+                return ActionResult(
+                    message=f"只有 {len(choices)} 个候选：{listed}"
+                            f"（请说「第一个」到「第{len(choices)}个」）",
+                    select_choices=choices, new_phase="idle", ok=False,
+                    heard_text=text)
+            self._pending_choices = None
+
+        # 「下一个/下一位/继续」：切到下一位未录完的学生。
+        # 指令词不含数字，与号码定位不冲突；名单里有同音姓名时优先当名字
+        if parser.is_next_student_cmd(text, names):
+            act = self.next_student()
+            act.heard_text = text
+            return act
 
         # 念了号码（「5号」「第五个」）就按号码定位，剩下的文本当分数
         if self.model is not None:
@@ -522,19 +702,31 @@ class AppState:
         # 再核对总分，否则整句进核对、前面的分数全被扔掉。
         # 这一判断必须赶在姓名纠错之前：听岔的「钟分」会被纠错改写成名单里
         # 的同音姓名，改完就再也认不出这是在念总分了
-        if self.current is not None and parser.find_total_keyword(text, names):
+        if self.model is not None and parser.find_total_keyword(text, names):
             head, _tail = parser.split_at_total(text, names)
             kw = dict(strip_prefix=self.cfg.get("strip_prefix", True),
                       strip_suffix=self.cfg.get("strip_suffix", True))
-            if (head and self.phase == "scoring"
+            # 句首念的是别人的名字：整句「张三…总分90」是那位学生的一条完整
+            # 记录，绝不能拿这个 90 去核对当前学生——上一位刚核对过的结论
+            # 会被改成不一致，而分数一个都没落到张三头上。
+            # 这一判断不能要求「已经选中了谁」：一节课的第一句往往就是
+            # 「孙丽第一题10分…总分100」，那时还没有当前学生，跳过这里的话
+            # 总分会被当成分数塞进最后一题
+            if self._other_student_in(head):
+                return self._scored_line_for_other(text, head)
+            if (self.current is not None and head and self.phase == "scoring"
                     and parser.extract_scores(head, **kw)
                     and [c for c in self.model.score_cols
                          if c not in self.current.scores]):
                 act = self.add_scores(head)          # head 不含关键词，不会递归
                 act2 = self.check_total(text)
                 act.message += f"；{act2.message}"
+                # 这一句的结论由核对决定：前半段填分成功不能盖掉核对不一致
+                act.ok = act2.ok
+                act.sound = act2.sound
                 return act
-            return self.check_total(text)
+            if self.current is not None:
+                return self.check_total(text)
 
         # 拼音级纠错：把「掌声」「成序题」这类同音误听纠正回名单/表头里的原词。
         # 表头先纠：它是固定的几个词，比姓名更容易判准，纠完剩下的才当人名猜

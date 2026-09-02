@@ -22,10 +22,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "write_formula": True,          # 总分列写 =SUM() 公式；False 则写计算好的数值
     "write_checked": True,          # 一致时核对列写"✓"；False 则不写
     "auto_save": True,              # 兼容旧配置：False 等同 auto_save_mode="manual"
-    "auto_save_mode": "score",      # score=每填一个分数存 | student=每录完一人存 | manual=只手动存
+    # score=每填一个分数存 | student=每录完一人存 | checked=核对通过才存 | manual=只手动存
+    "auto_save_mode": "checked",
 
     # ---- 语音 ----
-    "engine": "sense-voice",        # sense-voice（整句解码，最准，推荐）| sherpa（边说边出字）| vosk | faster-whisper
+    "engine": "sense-voice",        # sense-voice（整句解码，最准，推荐）| paraformer（短句更快）| sherpa（边说边出字）| vosk | faster-whisper
     "model_dir": "models",
     "vosk_model": "vosk-model-small-cn-0.22",
     "whisper_model": "small",       # tiny/base/small
@@ -34,9 +35,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
     # ---- 交互 ----
     "hold_to_talk": False,          # 按住说话（False 为点击一次开/关）
+    "sound_enabled": False,         # 提示音（默认关，安静；开了才有填分/核对/报错的声音）
     "continuous": True,             # 连续听写：一直监听，说完一句停顿即自动执行
     "segment_gap": 0.7,             # 连续听写切句：说完一句停顿超过该秒数就识别
+    "auto_next": False,             # 录完一位（核对一致）后自动切到下一位未录学生
     "last_file": "",                # 上次打开的表格路径（启动时自动重新打开）
+    "window_geometry": "",          # 上次退出时的窗口位置与大小（如 1200x800+50+50）
 }
 
 
