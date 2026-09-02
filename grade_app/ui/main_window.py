@@ -18,7 +18,7 @@ from typing import List, Optional
 
 from .. import parser, platform_support, speech
 from ..config import load_config, save_config
-from ..excel_io import load_sheet, save_sheet
+from ..excel_io import check_mark_text, load_sheet, save_sheet
 from ..recorder import SILENT_LEVEL, Recorder
 from ..state import AppState
 from . import dialogs, theme
@@ -36,9 +36,17 @@ class GradeApp(tk.Tk):
         self._rec_queue: "queue.Queue" = queue.Queue()
         self.recorder = Recorder(cfg, self._emit)
         self._space_owns_rec = False   # 本次录音是否由空格启动
+        self._btn_owns_rec = False     # 本次录音是否由按住按钮启动
+        self._save_error_shown: Optional[str] = None   # 已提示过的保存错误
 
         self.title("成绩登记")
-        self.geometry("1200x800")
+        geom = cfg.get("window_geometry") or ""
+        if geom:
+            # 恢复上次窗口位置与大小；外接屏拔掉后位置可能飘到屏外，
+            # 交给 sanitize_geometry 校验，不合规就回落到默认尺寸
+            geom = platform_support.sanitize_geometry(
+                geom, self.winfo_screenwidth(), self.winfo_screenheight())
+        self.geometry(geom or "1200x800")
         self.minsize(1000, 660)
         self.fonts = theme.apply(self)
         self.scale = platform_support.dpi_scaling(self)
@@ -125,9 +133,13 @@ class GradeApp(tk.Tk):
         inner = tk.Frame(bar, bg=theme.SURFACE)
         inner.pack(fill="x", padx=theme.SPACE_XL, pady=theme.SPACE_XS)
 
+        # 按四种可能文字里最宽的那个定宽：否则切到「按住说话（或按住空格）」
+        # 时按钮会先撑开、一开始录音又缩回去，用起来一跳一跳
         self.btn_talk = RoundButton(
             inner, text=self._talk_idle_text(), command=self._on_talk_click,
-            font=self.fonts.body_bold, width=176, height=40)
+            on_press=self._on_talk_press, on_release=self._on_talk_release,
+            font=self.fonts.body_bold, height=40,
+            width=self._talk_button_width())
         self.btn_talk.pack(side="left")
         self.btn_talk.set_enabled(False)
 
@@ -205,25 +217,34 @@ class GradeApp(tk.Tk):
             **theme.sheet_options(self.fonts, row_height))
         self.sheet.pack(fill="both", expand=True, padx=1, pady=1)
         self.sheet.set_index_width(theme.scaled(60, self.scale))
+        self.sheet.table_align("center")
+        self.sheet.header_align("center")
 
         # 不开这些，单击选格、滚轮、方向键全都不响应。
         # 插入/删除行、排序、粘贴不能开：会打乱行与表格模型的对应关系
+        # select_all 同时管三件事：左上角全选三角是否显示、点它是否全选、
+        # Cmd/Ctrl+A 是否可用。不开的话左上角连三角都画不出来
         self.sheet.enable_bindings(
             "single_select", "drag_select", "row_select", "column_select",
-            "arrowkeys", "copy", "edit_cell", "rc_select",
+            "arrowkeys", "copy", "edit_cell", "rc_select", "select_all",
             "column_width_resize", "double_click_column_resize",
             "row_height_resize")
 
         self._menu_row: Optional[int] = None
         self._menu_col: Optional[int] = None
+        self._menu_area = "cell"      # 右键点的是 cell / row / column / all
         self.sheet.extra_bindings([
             ("cell_select", self._on_cell_select),
             ("shift_cell_select", self._on_cell_select),
             ("end_edit_cell", self._on_sheet_edit),
         ])
         platform_support.bind_right_click(self.sheet, self._on_sheet_right)
-        for seq in ("<Delete>", "<BackSpace>"):
-            self.sheet.MT.bind(seq, self._on_delete_key)
+        # 键盘焦点会落在被点的那块画布上：点行号在 RI、点列头在 CH、
+        # 点左上角全选在 TL。只绑 MT 的话，全选之后按 Delete 没人接
+        for canvas in (self.sheet.MT, self.sheet.RI, self.sheet.CH,
+                       self.sheet.TL):
+            for seq in ("<Delete>", "<BackSpace>"):
+                canvas.bind(seq, self._on_delete_key)
 
         self.row_menu = tk.Menu(self, tearoff=0)
 
@@ -298,20 +319,26 @@ class GradeApp(tk.Tk):
         """挑一个真正收得到声音的麦克风。
 
         结果只用于本次运行、不写回配置——蓝牙耳机连上或断开时设备索引会变，
-        固定下来反而会失效。
+        固定下来反而会失效。手动指定的设备若已拔掉/收不到音，也回退到自动挑选。
         """
-        if self.cfg.get("device") is not None:
-            return   # 老师在设置里手动选过，尊重手动选择
         try:
             import sounddevice as sd
             if not any(d.get("max_input_channels", 0) > 0
                        for d in sd.query_devices()):
                 return
+            manual = self.cfg.get("device")
+            if manual is not None:
+                # 尊重手动选择，但先验证它还收得到声音；失效就回退自动挑
+                if speech.device_has_sound(int(manual)):
+                    return
+                print(f"[mic] 手动设备 {manual} 收不到声音，回退自动挑选", flush=True)
             idx = speech.pick_mic_device()
             if idx is None:
                 self._emit("mic_silent", "")
                 return
-            self.cfg["device"] = idx
+            # 只记在录音器上，不写回 cfg：写回去的话，老师之后随手在设置里
+            # 点一次「保存」，这个本次挑中的编号就被当成他的选择固化了
+            self.recorder.device_override = idx
             self._emit("mic_picked", sd.query_devices(idx).get("name", f"设备{idx}"))
         except Exception as exc:  # noqa: BLE001
             # 回退到系统默认设备继续跑，但要留下痕迹：
@@ -382,6 +409,8 @@ class GradeApp(tk.Tk):
                 filetypes=[("Excel 工作簿", "*.xlsx"), ("所有文件", "*.*")])
         if not path:
             return
+        if not self._release_from_excel(path, quiet=quiet):
+            return
         print(f"[open] 加载表格: {path}", flush=True)
         try:
             model = load_sheet(path, self.cfg, backup=True)
@@ -405,6 +434,37 @@ class GradeApp(tk.Tk):
             f"已加载 {len(model.students)} 名学生、{model.score_count} 道题，"
             "念第一个学生的名字开始", "success")
 
+    def _release_from_excel(self, path: str, quiet: bool = False) -> bool:
+        """表格正被 Excel 开着就先让它交出来；返回 False 表示别继续加载。
+
+        两边同时开同一份表是纯粹的坏事：Windows 上本程序一次也写不进去，
+        macOS 上写得进去但 Excel 不重读盘，它一保存就把分数全盖掉。
+        只关这一个工作簿，Excel 里别的表格不动；老师在这份表里没保存的
+        改动会先存下来，接着加载到的就是他最新的内容。
+        """
+        while platform_support.excel_holds_file(path):
+            ok, why = platform_support.close_excel_workbook(path)
+            if ok:
+                self._notify(f"{why}（避免两边同时改同一份表格）", "info")
+                return True
+            if platform_support.file_is_writable(path):
+                # ~$ 标记还在但文件写得动：Excel 上次崩溃留下的残留，不用管
+                print(f"[open] 忽略残留的占用标记: {why}", flush=True)
+                return True
+            if quiet:
+                self._notify(
+                    f"表格正被 Excel 占用（{why}），请在 Excel 里关掉它，"
+                    "再点「打开表格」", "error")
+                return False
+            if not messagebox.askretrycancel(
+                    "表格正被 Excel 打开",
+                    f"{why}。\n\n"
+                    "同时开着两边会互相覆盖，请先在 Excel 里关掉这份表格，"
+                    "然后点「重试」。",
+                    icon="warning", parent=self):
+                return False
+        return True
+
     def _remember_last_file(self, path: str) -> None:
         """只把打开过的文件写回配置，不带上本次自动挑选的麦克风等运行期状态。"""
         try:
@@ -427,9 +487,33 @@ class GradeApp(tk.Tk):
         headers = [h if h else f"列{i + 1}" for i, h in enumerate(m.header)]
         self.sheet.headers(headers)
         for i in range(len(headers)):
-            width = 140 if i == m.name_col else 100
-            self.sheet.column_width(column=i, width=theme.scaled(width, self.scale))
+            self.sheet.column_width(column=i, width=self._column_floor(i))
+        self._autofit_columns()
         self.sheet.redraw()
+
+    def _column_floor(self, col: int) -> int:
+        """这一列至少多宽。窄表格不至于挤成一条，宽内容再由自适应加长。"""
+        m = self.state.model
+        name_col = m.name_col if m is not None else 0
+        return theme.scaled(140 if col == name_col else 100, self.scale)
+
+    def _autofit_columns(self) -> None:
+        """列宽取「放得下内容」与下限之间的较大者。
+
+        核对列不一致时写的是「不一致（报18 算19）」，比表头长一大截；
+        固定列宽要么把它截掉，要么让每一列都白留一截空白。
+        分数只有一两位，短于下限，所以填分过程中列宽不会来回跳。
+        set_sheet_data 会把列宽重置回默认，所以每次刷完数据都要重来一遍。
+        """
+        m = self.state.model
+        if m is None:
+            return
+        current = self.sheet.get_column_widths()
+        for col in range(len(m.header)):
+            need = max(self.sheet.get_column_text_width(col),
+                       self._column_floor(col))
+            if col >= len(current) or round(current[col]) != round(need):
+                self.sheet.column_width(column=col, width=need, redraw=False)
 
     def _refresh_table(self) -> None:
         m = self.state.model
@@ -447,12 +531,15 @@ class GradeApp(tk.Tk):
             if stu.total is not None:
                 values[m.total_col] = f"{stu.total:g}"
             if stu.checked is not None:
-                values[m.check_col] = "✓" if stu.checked else "不一致"
+                values[m.check_col] = ("✓" if stu.checked
+                                       else check_mark_text(stu))
             data.append(values)
-            index.append(stu.row + 1)      # Excel 里的实际行号
+            index.append(stu.row + 1)      # Excel 里的实际行号，跟 Excel 对得上
 
+        # set_sheet_data 会把列宽重置回默认，自适应必须排在它后面
         self.sheet.set_sheet_data(data, redraw=False)
         self.sheet.row_index(index)
+        self._autofit_columns()
         self.sheet.dehighlight_all()
         self._paint_rows(m, row_to_idx, current_row)
         if current_row is not None and current_row in row_to_idx:
@@ -474,8 +561,14 @@ class GradeApp(tk.Tk):
         if current_row is None or current_row not in row_to_idx:
             return
         cur_idx = row_to_idx[current_row]
-        self.sheet.highlight_rows(rows=[cur_idx], bg=theme.PRIMARY_SOFT,
+        # 十字定位照 Excel 的做法：整行高亮的只有当前学生自己那一行，
+        # 「在填哪一题」靠列表头指示——把整列铺黄会连别人的分数一起染上，
+        # 而且斑马纹行的行高亮会压过列高亮，那一列黄一格灰一格更难看
+        self.sheet.highlight_rows(rows=[cur_idx], bg=theme.CURRENT_ROW,
                                   redraw=False)
+        self.sheet.highlight_cells(row=cur_idx, canvas="index",
+                                   bg=theme.CROSS_CELL,
+                                   fg=theme.CROSS_CELL_FG, redraw=False)
         if self.state.phase != "scoring" or self.state.current is None:
             return
         # 念过题号的话就指着那一题，否则指下一个空题
@@ -484,9 +577,13 @@ class GradeApp(tk.Tk):
         if target is None and blanks:
             target = blanks[0]
         if target is not None:
+            self.sheet.highlight_cells(column=target, canvas="header",
+                                       bg=theme.CROSS_CELL,
+                                       fg=theme.CROSS_CELL_FG, redraw=False)
+            # 单元格高亮盖过行高亮，交叉那一格单独上深色
             self.sheet.highlight_cells(row=cur_idx, column=target,
-                                       bg=theme.PENDING_CELL, fg=theme.TEXT,
-                                       redraw=False)
+                                       bg=theme.CROSS_CELL,
+                                       fg=theme.CROSS_CELL_FG, redraw=False)
         for row, _name in (self.state._pending_choices or []):
             if row in row_to_idx:
                 self.sheet.highlight_rows(rows=[row_to_idx[row]],
@@ -506,14 +603,70 @@ class GradeApp(tk.Tk):
         self.heard.append(heard)
         if result.select_choices and result.ok:
             # 重名：必须挑一个才能往下走，用模态窗
+            self._beep("pick")
             self._show_choice_dialog(result.select_choices)
         elif result.select_choices:
             # 只是没太听清：不弹窗挡住语音流，把候选高亮在表里，
             # 老师说一句「第一个」就能定，也可以直接点那一行
+            self._beep("pick")
             self._notify(result.message, "warn")
         elif result.message:
-            self._notify(result.message, "success" if result.ok else "warn")
+            # 状态机指定了音效就照它来（核对通过/不一致各有各的声音），
+            # 没指定才退回按成败取默认
+            self._beep(result.sound or ("ok" if result.ok else "warn"))
+            level = ("success" if result.ok
+                     else "error" if result.sound == "error" else "warn")
+            self._notify(result.message, level)
+        self._report_save_error()
         self._after_action()
+
+    def _save_before_exit(self) -> bool:
+        """退出前落盘。返回 False 表示老师选择留在程序里，先别退。
+
+        Windows 上 Excel 会独占锁住表格，这时写盘必然失败。原来只往日志里
+        记一行就把窗口销毁了，一节课的分数跟着没——现在必须问过老师。
+        """
+        while True:
+            try:
+                save_sheet(self.state.model, self.cfg,
+                           write_formula=self.cfg.get("write_formula", True))
+                return True
+            except Exception as e:  # noqa: BLE001
+                print(f"[warn] 退出前保存失败: {e}", flush=True)
+                reason = ("表格正被 Excel 或其他程序占用，写不进去。"
+                          if isinstance(e, PermissionError) else f"{e}")
+                answer = messagebox.askyesnocancel(
+                    "退出前没能保存",
+                    f"{reason}\n\n"
+                    "「是」  关掉占用它的程序后重试保存\n"
+                    "「否」  放弃这些分数直接退出\n"
+                    "「取消」留在本程序里，稍后自己点「保存」",
+                    icon="warning", default="cancel", parent=self)
+                if answer is None:
+                    return False        # 留下
+                if answer is False:
+                    return True         # 放弃改动，照旧退出
+                # answer is True：老师说已经关掉了，回到循环再试一次
+
+    def _beep(self, kind: str) -> None:
+        """提示音的唯一出口，默认关着。
+
+        一节课要念几百句，每句都响一声很吵；办公室或办公桌相邻时更不合适。
+        想要声音反馈的老师在设置里自己打开。
+        """
+        if self.cfg.get("sound_enabled", False):
+            platform_support.play_sound(kind)
+
+    def _report_save_error(self) -> None:
+        """自动保存写不进去时必须让老师看见，别让分数只留在内存里。"""
+        err = self.state.save_error
+        if err and err != self._save_error_shown:
+            self._save_error_shown = err
+            self._beep("error")
+            self._notify(err, "error")
+            self.heard.append(f"（{err}）", "note")
+        elif not err:
+            self._save_error_shown = None
 
     def _after_action(self) -> None:
         m = self.state.model
@@ -528,7 +681,8 @@ class GradeApp(tk.Tk):
             filled = m.filled_count(cur)
             self.lbl_student.config(text=cur.name, fg=theme.TEXT)
             self.lbl_progress.config(
-                text=f"第 {cur.row + 1} 行 · {filled}/{m.score_count} 题")
+                text=f"第 {cur.row + 1} 行 · 第 {self.state.student_no(cur)} 个"
+                     f" · {filled}/{m.score_count} 题")
             self.progress.set_progress(filled, m.score_count)
         self._refresh_table()
 
@@ -545,9 +699,17 @@ class GradeApp(tk.Tk):
         if not path or not os.path.exists(path):
             self._notify("还没有打开表格", "warn")
             return
+        warn = platform_support.excel_open_warning()
+        if warn and self.state.auto_save_mode() != "manual":
+            if not messagebox.askokcancel("要现在用 Excel 打开吗", warn,
+                                          icon="warning", parent=self):
+                return
         try:
             platform_support.open_in_default_app(path)
-            self._notify(f"已用默认程序打开 {os.path.basename(path)}", "success")
+            note = "；期间自动保存会失败" if warn else ""
+            self._notify(
+                f"已用默认程序打开 {os.path.basename(path)}{note}",
+                "warn" if warn else "success")
         except Exception as e:  # noqa: BLE001
             self._notify(f"打开失败：{e}", "error")
 
@@ -576,6 +738,18 @@ class GradeApp(tk.Tk):
     def _is_continuous(self) -> bool:
         return not self._is_hold() and bool(self.cfg.get("continuous", True))
 
+    # 说话按钮在各模式下的全部文字，宽度按最宽的那个定
+    TALK_LABELS = ("开始说话", "开始录音", "按住说话（或按住空格）",
+                   "正在听…点此结束", "正在听…松开结束")
+
+    def _talk_button_width(self) -> int:
+        from tkinter import font as tkfont
+        try:
+            measure = tkfont.Font(root=self, font=self.fonts.body_bold).measure
+        except Exception:  # noqa: BLE001
+            return theme.scaled(220, self.scale)
+        return max(measure(t) for t in self.TALK_LABELS) + 32
+
     def _talk_idle_text(self) -> str:
         if self._is_hold():
             return "按住说话（或按住空格）"
@@ -600,6 +774,25 @@ class GradeApp(tk.Tk):
                                      fill=theme.RECORDING,
                                      hover=theme.RECORDING_HOVER)
         self.btn_talk.set_enabled(True)
+
+    def _on_talk_press(self) -> None:
+        """按住说话模式下，按下按钮就开录。
+
+        RoundButton 只在松开时触发 command，所以不接这个回调的话，
+        「按住说话」按钮怎么按都不会开始录音。
+        """
+        if not self._is_hold() or self.recorder.recording:
+            return
+        if self._start_recording():
+            self._btn_owns_rec = True
+
+    def _on_talk_release(self) -> bool:
+        """松开按钮。返回 True 表示这次是长按，别再当成一次点击。"""
+        if not self._btn_owns_rec:
+            return False
+        self._btn_owns_rec = False
+        self._stop_recording()
+        return True
 
     def _on_talk_click(self) -> None:
         if self._is_hold():
@@ -638,6 +831,10 @@ class GradeApp(tk.Tk):
         self._space_owns_rec = False
 
     def _on_space_press(self, _event) -> None:
+        # 空格只在「按住说话」模式下管录音。点击说话模式里不拦的话，
+        # 随手碰一下空格就是「开录又立刻停」，白丢一句
+        if not self._is_hold():
+            return
         if isinstance(self.focus_get(), (tk.Entry, tk.Text, ttk.Entry)):
             return
         # 只有空格自己开的录音才由空格结束，避免误碰空格停掉按钮开的录音
@@ -650,12 +847,24 @@ class GradeApp(tk.Tk):
 
     # ================================================================= 队列
     def _poll_queue(self) -> None:
+        """把录音线程发来的事件搬到主线程处理。
+
+        音量是个仪表，一轮里只画最后一个值：会大量堆积的只有它，而每条
+        都重绘画布，积压时能把界面冻住一秒以上。识别结果一类事件绝不设
+        上限——漏处理一条就是丢一句话。
+        """
+        level = None
         try:
             while True:
                 kind, payload = self._rec_queue.get_nowait()
+                if kind == "level":
+                    level = payload
+                    continue
                 self._handle_event(kind, payload)
         except queue.Empty:
             pass
+        if level is not None:
+            self._handle_event("level", level)
         self.after(120, self._poll_queue)
 
     def _handle_event(self, kind: str, payload) -> None:
@@ -667,6 +876,7 @@ class GradeApp(tk.Tk):
             self.meter.reset()
             self._on_text(payload)
         elif kind == "final_empty":
+            self._beep("warn")
             self.lbl_partial.config(text="没有听到内容")
             self.heard.append("（这一句没听清）", "note")
             self._settle_button()
@@ -698,10 +908,11 @@ class GradeApp(tk.Tk):
         elif kind == "mic_picked":
             self.lbl_status.config(text=f"语音引擎：加载中 · 麦克风：{payload}")
         elif kind == "mic_silent":
-            self.lbl_partial.config(text="这次没有检测到麦克风声音")
-            self.heard.append("（没有检测到麦克风声音）", "note")
-            self._notify("没检测到麦克风声音，点一次「开始说话」再试；"
-                         "反复出现请看「帮助 → 麦克风没声音？」", "warn")
+            self.lbl_partial.config(text="没检测到麦克风声音：先检查系统麦克风权限")
+            self.heard.append("（没检测到麦克风声音）", "note")
+            self._notify("没检测到麦克风声音：请在「系统设置 → 隐私与安全性 → "
+                         "麦克风」里打开本程序（或终端）的开关，再点一次「开始说话」",
+                         "warn")
         elif kind == "engine_error":
             self._set_talk_idle()
             self._on_engine_error(str(payload))
@@ -743,7 +954,7 @@ class GradeApp(tk.Tk):
     def _current_mic_name(self) -> str:
         try:
             import sounddevice as sd
-            device = self.cfg.get("device")
+            device = self.recorder.active_device()
             if device is None:
                 device = sd.default.device[0]
             if device is not None and int(device) >= 0:
@@ -758,27 +969,63 @@ class GradeApp(tk.Tk):
 
     def _show_choice_dialog(self, choices: List[tuple]) -> None:
         def pick(row: int) -> None:
-            self.state.activate_row(row)
+            act = self.state.activate_row(row)
             self._after_action()
-            current = self.state.current
-            if current is not None:
-                self._notify(f"已选中 {current.name}（第 {row + 1} 行），请念分数",
-                             "success")
+            self._notify(act.message, "success" if act.ok else "warn")
 
-        self._notify("听到多个候选，请在弹窗里选择学生", "warn")
+        # 选人期间先停下听写：弹窗要等老师点，这段时间他常会自言自语
+        # （「第一个…不对…第三个」），那些话照旧进状态机就会跳到别处去
+        was_listening = self.recorder.recording
+        if was_listening:
+            self._stop_recording()
+            self._set_talk_idle()
+            self.lbl_partial.config(text="选人期间暂停听写…")
+        self._notify("听到多个候选，请在弹窗里选择学生（听写已暂停）", "warn")
         dialogs.StudentChoiceDialog(self, self.fonts, choices, pick).show()
+        if was_listening:
+            self._resume_after_choice()
+
+    def _resume_after_choice(self) -> None:
+        """弹窗关掉后接着听。上一轮识别可能还在收尾，等它退出再开。"""
+        if self.recorder.recording:
+            return
+        if self.recorder.busy:
+            self.after(120, self._resume_after_choice)
+            return
+        if self._start_recording():
+            self.heard.append("（选人完毕，继续听）", "note")
 
     def open_settings(self) -> None:
         dialogs.SettingsDialog(self, self.fonts, self.cfg, self._apply_settings).show()
 
     def _apply_settings(self, new_cfg: dict) -> None:
-        engine_changed = new_cfg.get("engine") != self.cfg.get("engine")
+        # 必须先看键在不在：只传了部分设置时，缺 engine 会被当成「改成 None」，
+        # 白白重启一次引擎，按钮跟着禁用几秒
+        engine_changed = ("engine" in new_cfg
+                          and new_cfg["engine"] != self.cfg.get("engine"))
+        if "device" in new_cfg and new_cfg["device"] != self.cfg.get("device"):
+            # 老师亲手换了麦克风：清掉本次自动挑中的，让新选择立刻生效
+            self.recorder.device_override = None
         self.cfg.update(new_cfg)
         self.state.cfg = self.cfg
         save_config(new_cfg)      # 只写用户改过的项，不固化运行期状态
+        if engine_changed:
+            self._restart_engine()
         self._set_talk_idle()
-        self._notify("设置已保存" + ("，切换语音引擎需重启程序生效"
-                                     if engine_changed else ""), "success")
+        self._notify("设置已保存" + ("，正在切换语音引擎…" if engine_changed else ""),
+                     "success")
+
+    def _restart_engine(self) -> None:
+        """切换识别引擎：不用重启程序，停掉旧引擎后后台加载新引擎。
+
+        旧引擎对象直接丢弃（连同它的热词文件），引擎未就绪期间
+        「开始说话」按钮保持禁用。
+        """
+        self.recorder.stop()
+        self.recorder.engine = None
+        self.engine_ready = False
+        self._set_talk_idle()
+        self._ensure_engine()
 
     def show_help(self) -> None:
         dialogs.HelpDialog(self, self.fonts).show()
@@ -810,15 +1057,42 @@ class GradeApp(tk.Tk):
         self._after_action()
         current = self.state.current
         if announce and current is not None:
-            self._notify(f"已选中 {current.name}（第 {current.row + 1} 行），请念分数",
+            self._notify(f"已选中 {current.name}（第 {current.row + 1} 行 · "
+                         f"第 {self.state.student_no(current)} 个），请念分数",
                          "success")
+
+    def _menu_zone(self, event) -> str:
+        """右键点在表格的哪一块：cell / row / column / all。
+
+        照 Excel 的分法给不同的菜单。只看 row/col 是否为 None 分不开
+        列头和左上角——两者都没有行号。
+        """
+        widget = getattr(event, "widget", None)
+        if widget is self.sheet.RI:
+            return "row"
+        if widget is self.sheet.CH:
+            return "column"
+        if widget is self.sheet.TL:
+            return "all"
+        return "cell"
 
     def _on_sheet_right(self, event) -> None:
         row = self.sheet.identify_row(event, allow_end=False)
         col = self.sheet.identify_column(event, allow_end=False)
-        if row is not None:
-            self._menu_row = int(row)
-            self._menu_col = int(col) if col is not None else None
+        # 列头上右键没有行、行号列上右键没有列，两者各自记各自的：
+        # 把列号的赋值挂在「有行」里面，列头右键就永远拿不到列，
+        # 「清除整列」会一直是灰的
+        self._menu_row = int(row) if row is not None else None
+        self._menu_col = int(col) if col is not None else None
+        self._menu_area = self._menu_zone(event)
+        # 照 Excel：右键先把作用范围选出来，让菜单要动谁一目了然
+        if self._menu_area == "all":
+            self.sheet.select_all()
+        elif self._menu_area == "row" and self._menu_row is not None:
+            self.sheet.select_row(self._menu_row)
+        elif self._menu_area == "column" and self._menu_col is not None:
+            self.sheet.select_column(self._menu_col)
+        elif row is not None:
             # 右键落在已选区域内就保留整片选区，否则改选这一格
             if (self._menu_col is None
                     or (self._menu_row, self._menu_col) not in self._selected_cells()):
@@ -848,22 +1122,87 @@ class GradeApp(tk.Tk):
         return out
 
     def _build_row_menu(self) -> None:
-        """按右键位置重建菜单：不在分数列上就不提供清除单格。"""
+        """按右键位置重建菜单，条目与排布尽量贴合 Excel。
+
+        插入/删除行列一概不给：那会打乱表格行与名单的对应关系。
+        够不着的目标置灰而不是隐藏，位置稳定，不用每次重新找。
+        """
+        menu = self.row_menu
+        menu.delete(0, "end")
         m = self.state.model
-        self.row_menu.delete(0, "end")
-        self.row_menu.add_command(label="设为当前学生", command=self._menu_activate)
+        copy_key, _seq = platform_support.accelerator("c")
+        area = getattr(self, "_menu_area", "cell")
+
+        # 左上角只给一条：这里唯一说得通的操作就是清空全班
+        if area == "all":
+            menu.add_command(
+                label="清除全部分数（全班所有题）", command=self._menu_clear_all,
+                state="normal" if m is not None else "disabled")
+            return
+
+        menu.add_command(label="复制", accelerator=copy_key,
+                         command=self._menu_copy)
         if m is None:
             return
-        self.row_menu.add_separator()
+        on_row = self._menu_row is not None
         on_score = self._menu_col is not None and self._menu_col in m.score_cols
-        self.row_menu.add_command(
-            label="清除此格", command=self._menu_clear_cell,
-            state="normal" if on_score else "disabled")
-        self.row_menu.add_command(label="清除整行分数（该生所有题）",
-                                  command=self._menu_clear_row)
-        self.row_menu.add_command(
+
+        if area == "column":
+            menu.add_command(
+                label="清除整列分数（全班这一题）", command=self._menu_clear_column,
+                state="normal" if on_score else "disabled")
+            return
+
+        if area == "row":
+            menu.add_command(
+                label="清除整行分数（该生所有题）", command=self._menu_clear_row,
+                state="normal" if on_row else "disabled")
+            menu.add_separator()
+            menu.add_command(
+                label="设为当前学生", command=self._menu_activate,
+                state="normal" if on_row else "disabled")
+            return
+
+        menu.add_command(
+            label="清除内容", accelerator="Delete",
+            command=self._menu_clear_cell,
+            state="normal" if on_score and on_row else "disabled")
+        menu.add_separator()
+        menu.add_command(
+            label="清除整行分数（该生所有题）", command=self._menu_clear_row,
+            state="normal" if on_row else "disabled")
+        menu.add_command(
             label="清除整列分数（全班这一题）", command=self._menu_clear_column,
             state="normal" if on_score else "disabled")
+        menu.add_separator()
+        menu.add_command(
+            label="设为当前学生", command=self._menu_activate,
+            state="normal" if on_row else "disabled")
+
+    def _menu_copy(self) -> None:
+        """把选区交给 tksheet 自己的复制，跟 Excel 一样进系统剪贴板。"""
+        try:
+            self.sheet.MT.ctrl_c()
+        except Exception as e:  # noqa: BLE001
+            self._notify(f"复制失败：{e}", "warn")
+
+    def _menu_clear_all(self) -> None:
+        """清空全班所有题的分数，整批算一次操作、一次撤销。"""
+        m = self.state.model
+        if m is None:
+            return
+        targets = [(stu, col) for stu in m.students for col in m.score_cols]
+        if not any(col in stu.scores for stu, col in targets):
+            self._notify("表里还没有分数可清除", "warn")
+            return
+        if not messagebox.askyesno(
+                "清除全部分数",
+                f"要清空全班 {len(m.students)} 位学生共 {m.score_count} 道题的"
+                "分数吗？\n\n可以按「撤销」一次找回。",
+                icon="warning", parent=self):
+            return
+        self._apply_clear(self._score_targets(
+            {(i, col) for i in range(len(m.students)) for col in m.score_cols}))
 
     def _apply_clear(self, targets: list) -> None:
         if not targets:
@@ -968,12 +1307,14 @@ class GradeApp(tk.Tk):
 
     def _on_close(self) -> None:
         self.recorder.stop()
-        if self.state.model is not None:
-            try:
-                save_sheet(self.state.model, self.cfg,
-                           write_formula=self.cfg.get("write_formula", True))
-            except Exception as e:  # noqa: BLE001
-                print(f"[warn] 退出前保存失败: {e}", flush=True)
+        if self.state.model is not None and not self._save_before_exit():
+            return          # 没存成、老师选择留下：不退出
+
+        # 记住窗口位置与大小，下次启动原样恢复
+        try:
+            save_config({"window_geometry": self.geometry()})
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] 保存窗口位置失败: {e}", flush=True)
         self.destroy()
 
 

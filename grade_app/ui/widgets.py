@@ -33,10 +33,21 @@ class RoundButton(tk.Canvas):
                  hover: str = theme.PRIMARY_HOVER,
                  disabled: str = theme.PRIMARY_DISABLED,
                  fg: str = "white", width: int = 220, height: int = 52,
-                 bg: str = theme.SURFACE, radius: int = theme.RADIUS):
+                 bg: str = theme.SURFACE, radius: int = theme.RADIUS,
+                 on_press: Optional[Callable[[], None]] = None,
+                 on_release: Optional[Callable[[], bool]] = None):
+        """on_press / on_release 供「按住」用。
+
+        on_release 返回 True 表示这次已按长按处理完，不再当成一次点击，
+        否则接着触发 command。
+        """
         super().__init__(parent, width=width, height=height, bg=bg,
                          highlightthickness=0, bd=0, cursor="hand2")
         self._command = command
+        self._press_cb = on_press
+        self._release_cb = on_release
+        self._font = font
+        self._min_width = width      # 传进来的宽度当下限，文字更长就加宽
         self._fill = fill
         self._hover = hover
         self._disabled_fill = disabled
@@ -54,14 +65,33 @@ class RoundButton(tk.Canvas):
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<ButtonRelease-1>", self._on_release)
         self.bind("<Configure>", self._on_resize)
+        self._fit_to_text(text)
 
     # ---------------- 外观 ----------------
+    TEXT_PADDING = 32      # 文字左右各留一截，别贴着圆角
+
+    def _fit_to_text(self, text: str) -> None:
+        """按文字实测宽度定按钮宽度，不短于建这个按钮时给的下限。
+
+        文字随状态变（「开始说话」↔「按住说话（或按住空格）」差 100 多像素），
+        固定宽度会把长的那个从两头切掉——画布只会裁剪，不会告诉你放不下。
+        """
+        try:
+            from tkinter import font as tkfont
+            need = tkfont.Font(root=self, font=self._font).measure(text)
+        except Exception:  # noqa: BLE001
+            return                     # 量不出来就保持原宽，不至于崩
+        want = max(self._min_width, need + self.TEXT_PADDING)
+        if want != int(self.cget("width")):
+            self.configure(width=want)
+
     def configure_look(self, text: Optional[str] = None,
                        fill: Optional[str] = None,
                        hover: Optional[str] = None,
                        disabled: Optional[str] = None) -> None:
         if text is not None:
             self.itemconfigure(self._label, text=text)
+            self._fit_to_text(text)
         if fill is not None:
             self._fill = fill
         if hover is not None:
@@ -104,15 +134,22 @@ class RoundButton(tk.Canvas):
         self._repaint()
 
     def _on_press(self, _event) -> None:
-        if self._enabled:
-            self._pressed = True
-            self._repaint()
+        if not self._enabled:
+            return
+        self._pressed = True
+        self._repaint()
+        if self._press_cb is not None:
+            self._press_cb()
 
     def _on_release(self, _event) -> None:
         was_pressed = self._pressed
         self._pressed = False
         self._repaint(hovering=True)
-        if self._enabled and was_pressed:
+        if not (self._enabled and was_pressed):
+            return
+        if self._release_cb is not None and self._release_cb():
+            return        # 长按已处理完，不再当成一次点击
+        if self._command is not None:
             self._command()
 
 

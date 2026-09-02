@@ -49,6 +49,12 @@ RECORDING_HOVER = "#b91c1c"
 PENDING_CELL = "#fff8db"   # 下一个待填的题
 EDITED_CELL = "#2563eb"    # 刚填/刚改的格子
 
+# 当前定位的十字高亮：当前学生整行铺浅黄，行号、列表头与交叉格用深黄，
+# 一眼看出「现在在填谁的哪一题」。别的学生那几格一律不动
+CURRENT_ROW = "#fff3c4"
+CROSS_CELL = "#ffd43b"
+CROSS_CELL_FG = "#5c4400"
+
 MESSAGE_COLORS = {
     "info": (INFO, INFO_SOFT),
     "success": (SUCCESS, SUCCESS_SOFT),

@@ -8,6 +8,7 @@ from tkinter import ttk
 from typing import Callable, List, Tuple
 
 from .. import platform_support, speech
+from ..config import DEFAULT_CONFIG
 from ..recorder import SegmentTimer
 from . import theme
 from .widgets import OptionGroup, OptionRow
@@ -100,10 +101,13 @@ class SettingsDialog:
     CHECKS = (
         ("语音", (
             ("hold_to_talk", "按住说话", "关闭则点一下开始、再点一下结束"),
+            ("sound_enabled", "提示音",
+             "填分、核对通过、核对不一致、没听清各有不同的声音；默认关闭"),
         )),
         ("录入", (
             ("strip_prefix", "剥离题号前缀", "念「第一题18分」时只取 18"),
             ("strip_suffix", "剥离「分」后缀", "念「18分」时取 18"),
+            ("auto_next", "录完自动切下一位", "核对一致后自动选中名单里下一位未录完的学生"),
         )),
         ("写回 Excel", (
             ("write_formula", "总分写 =SUM() 公式", "关闭则写算好的数值"),
@@ -111,6 +115,7 @@ class SettingsDialog:
         )),
     )
     SAVE_MODES = (
+        ("checked", "总分核对通过才保存", "只把对得上的结果同步进 Excel"),
         ("score", "每填一个分数就保存", "最稳妥，中途退出也不丢"),
         ("student", "每录完一名学生保存", "整行填完或核对完才写盘"),
         ("manual", "只在点「保存」时写盘", "自己掌握保存时机"),
@@ -161,13 +166,22 @@ class SettingsDialog:
                 self._field(group, "麦克风", mic_var, mic_values,
                             "自动选择会在每次启动时挑一个收得到声音的设备"
                             if mics else "没有检测到麦克风")
-                self._field(group, "断句停顿", gap_var,
-                            [label for _sec, label in self.GAP_CHOICES],
-                            "连续听写时，说完一句停顿多久就自动识别")
+                # sherpa 用引擎自带的端点检测，这个档位对它不起作用，
+                # 照旧摆一个能点的下拉就是假设置
+                gap_used = engine_var.get() not in speech.NATIVE_ENDPOINT_ENGINES
+                gap_combo = self._field(
+                    group, "断句停顿", gap_var,
+                    [label for _sec, label in self.GAP_CHOICES],
+                    "连续听写时，说完一句停顿多久就自动识别" if gap_used
+                    else "当前引擎自带端点检测，这一项对它不起作用")
+                if not gap_used:
+                    gap_combo.configure(state="disabled")
             for key, label, hint in items:
                 row = OptionRow(group, label, hint, self.fonts.body,
                                 self.fonts.small)
-                row.set(bool(self.cfg.get(key, True)))
+                # 兜底值必须取自 DEFAULT_CONFIG：写死 True 的话，配置里缺
+                # hold_to_talk / auto_next 时面板显示「开」而代码按「关」跑
+                row.set(bool(self.cfg.get(key, DEFAULT_CONFIG.get(key, True))))
                 row.pack(fill="x", pady=1)
                 rows[key] = row
 
@@ -183,7 +197,7 @@ class SettingsDialog:
                 # 蓝牙耳机连上/断开后设备索引会变
                 "device": (None if mic_var.get() == "自动选择"
                            else int(mic_var.get().split(":")[0])),
-                "auto_save_mode": modes.get() or "score",
+                "auto_save_mode": modes.get() or "checked",
                 "segment_gap": next(
                     (sec for sec, label in self.GAP_CHOICES
                      if label == gap_var.get()),
@@ -280,7 +294,7 @@ class SettingsDialog:
 
     def _current_mode(self) -> str:
         mode = self.cfg.get("auto_save_mode")
-        if mode in ("score", "student", "manual"):
+        if mode in ("checked", "score", "student", "manual"):
             return mode
         return "score" if self.cfg.get("auto_save", True) else "manual"
 
